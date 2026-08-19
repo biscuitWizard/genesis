@@ -19,6 +19,7 @@ tracing-subscriber.workspace = true
 # wasm runtime
 wasmtime = { version = "47", features = ["component-model", "cranelift"] }
 wasmtime-wasi = "47"
+wasmtime-wasi-http = "47"
 
 # persistence
 redb = "4"

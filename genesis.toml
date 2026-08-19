@@ -144,6 +144,25 @@ timeout_secs = 900
 #   allowed_crates = ["regex", "serde", "chrono"]
 allowed_crates = []
 
+[wasi]
+# Guests run on WASI preview 2, which grants nothing until it is told to. These
+# are the grants. They apply to every guest; the component boundary, the memory
+# ceiling and the turn budget are what actually contain a tool.
+#
+# Outbound sockets and wasi:http. A tool that talks to a web API needs both of
+# these; TLS is terminated host-side, because no TLS crate builds for
+# wasm32-wasip2 (ring and openssl both need a C toolchain targeting wasm).
+network = true
+dns = true
+# The host's environment variables. Left off on purpose: OPENROUTER_API_KEY
+# lives there, and a tool has no business reading it. Tool secrets belong in a
+# [tools.<name>] block instead.
+env = false
+stdio = false
+# Directories guests get as preopens, readable and writable. Relative paths
+# resolve against the project root, and are created if missing.
+dirs = ["workspace"]
+
 [watchdog]
 # Failures inside this window count toward the same circuit breaker.
 failure_window_secs = 120

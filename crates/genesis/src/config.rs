@@ -100,6 +100,26 @@ pub struct BuildSettings {
     pub allowed_crates: Vec<String>,
 }
 
+/// What the WASI sandbox actually hands to a guest.
+///
+/// Guests run on WASI preview 2, which is capability-based: the interfaces are
+/// linked either way, but they do nothing at all until a capability is granted.
+/// Before this existed the context was built empty, so a tool could link
+/// `reqwest`, compile it, and then find no sockets underneath at runtime.
+#[derive(Debug, Clone)]
+pub struct WasiSettings {
+    /// Outbound sockets and `wasi:http`. Any tool calling a web API needs it.
+    pub network: bool,
+    /// Name resolution. Without it a guest can only reach literal addresses.
+    pub dns: bool,
+    /// The host's environment variables.
+    pub env: bool,
+    /// The host's stdin, stdout and stderr.
+    pub stdio: bool,
+    /// Directories handed to guests as preopens, readable and writable.
+    pub dirs: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone)]
 pub struct WatchdogSettings {
     pub failure_window: Duration,
@@ -238,6 +258,7 @@ pub struct Config {
 
     pub cache: CacheSettings,
     pub build: BuildSettings,
+    pub wasi: WasiSettings,
     pub watchdog: WatchdogSettings,
     pub devkit: DevkitSettings,
     pub filesystem: FilesystemSettings,
@@ -341,6 +362,7 @@ mod spec {
         pub filesystem: Filesystem,
         pub terminal: Terminal,
         pub control: Control,
+        pub wasi: Wasi,
         /// Free-form per-tool settings. Shapes are up to each tool, so this is
         /// carried as-is rather than being given a schema here.
         pub tools: std::collections::BTreeMap<String, toml::Value>,
@@ -553,6 +575,31 @@ mod spec {
 
     #[derive(Debug, Deserialize)]
     #[serde(default, deny_unknown_fields)]
+    pub struct Wasi {
+        pub network: bool,
+        pub dns: bool,
+        pub env: bool,
+        pub stdio: bool,
+        pub dirs: Vec<String>,
+    }
+    impl Default for Wasi {
+        fn default() -> Self {
+            Self {
+                // Permissive: a tool that cannot reach the network cannot be a
+                // web tool, and the component boundary is still the sandbox.
+                network: true,
+                dns: true,
+                // Deliberately not permissive. The host environment is where
+                // the API keys live, and no guest has a reason to read them.
+                env: false,
+                stdio: false,
+                dirs: vec!["workspace".into()],
+            }
+        }
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(default, deny_unknown_fields)]
     pub struct Watchdog {
         pub failure_window_secs: u64,
         pub failure_threshold: usize,
@@ -684,6 +731,45 @@ fn discover_root(start: &Path) -> Option<PathBuf> {
 }
 
 /// Joins a configured path onto the root unless it is already absolute.
+/// `genesis.toml` -> `genesis.local.toml`, keeping any other stem intact.
+fn local_overlay_path(config_path: &Path) -> PathBuf {
+    let stem = config_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "genesis".to_string());
+    config_path.with_file_name(format!("{stem}.local.toml"))
+}
+
+fn read_toml(path: &Path) -> Result<toml::Value> {
+    if !path.is_file() {
+        return Ok(toml::Value::Table(toml::map::Map::new()));
+    }
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+}
+
+/// Deep-merges `overlay` into `base`, with the overlay winning.
+///
+/// Recursive on tables so an overlay can set one key of one tool without
+/// restating the whole section. Arrays are replaced rather than concatenated:
+/// appending would make it impossible to shorten a list from the overlay.
+fn merge_toml(base: &mut toml::Value, overlay: toml::Value) {
+    match (base, overlay) {
+        (toml::Value::Table(base), toml::Value::Table(overlay)) => {
+            for (key, value) in overlay {
+                match base.get_mut(&key) {
+                    Some(existing) => merge_toml(existing, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, overlay) => *base = overlay,
+    }
+}
+
 fn resolve(root: &Path, value: &str) -> PathBuf {
     let path = Path::new(value);
     if path.is_absolute() {
@@ -706,16 +792,29 @@ impl Config {
             None => root.join("genesis.toml"),
         };
 
-        let file: spec::File = if config_path.is_file() {
-            let text = std::fs::read_to_string(&config_path)
-                .with_context(|| format!("reading {}", config_path.display()))?;
-            toml::from_str(&text)
-                .with_context(|| format!("parsing {}", config_path.display()))?
-        } else {
-            spec::File::default()
-        };
+        let mut merged = read_toml(&config_path)?;
+
+        // `genesis.toml` is committed; the local overlay beside it is not.
+        // Secrets that belong to a tool - an API key for a service it calls -
+        // have nowhere else to go, since a tool's settings are read from the
+        // config file rather than the environment.
+        let local_path = local_overlay_path(&config_path);
+        if local_path.is_file() {
+            merge_toml(&mut merged, read_toml(&local_path)?);
+            tracing::debug!(overlay = %local_path.display(), "applied local config overlay");
+        }
+
+        let file: spec::File = merged
+            .try_into()
+            .with_context(|| format!("parsing {}", config_path.display()))?;
 
         Self::assemble(root, config_path, file)
+    }
+
+    /// The overlay that sits beside a config file: `genesis.toml` becomes
+    /// `genesis.local.toml`.
+    pub fn local_overlay(&self) -> PathBuf {
+        local_overlay_path(&self.config_path)
     }
 
     /// Checks that a candidate config file would load, without applying it.
@@ -884,6 +983,14 @@ impl Config {
                     env_parse("GENESIS_BUILD_TIMEOUT_SECS", file.build.timeout_secs).max(1),
                 ),
                 allowed_crates: file.build.allowed_crates,
+            },
+
+            wasi: WasiSettings {
+                network: env_parse("GENESIS_WASI_NETWORK", file.wasi.network),
+                dns: env_parse("GENESIS_WASI_DNS", file.wasi.dns),
+                env: env_parse("GENESIS_WASI_ENV", file.wasi.env),
+                stdio: env_parse("GENESIS_WASI_STDIO", file.wasi.stdio),
+                dirs: file.wasi.dirs.iter().map(|d| resolve(&root, d)).collect(),
             },
 
             watchdog: WatchdogSettings {
@@ -1290,5 +1397,69 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.models.len(), 1);
         assert_eq!(cfg.models[0].label, "local/tiny");
+    }
+
+    #[test]
+    fn local_overlay_sits_beside_the_config_file() {
+        assert_eq!(
+            local_overlay_path(Path::new("/srv/app/genesis.toml")),
+            PathBuf::from("/srv/app/genesis.local.toml")
+        );
+        assert_eq!(
+            local_overlay_path(Path::new("/srv/app/staging.toml")),
+            PathBuf::from("/srv/app/staging.local.toml")
+        );
+    }
+
+    #[test]
+    fn overlay_sets_one_key_without_restating_its_section() {
+        let mut base: toml::Value = toml::from_str(
+            "[llm]
+model = \"a/b\"
+max_retries = 3
+
+[tools.web-search]
+timeout = 30
+",
+        )
+        .unwrap();
+        let overlay: toml::Value =
+            toml::from_str("[tools.web-search]
+api_key = \"secret\"
+").unwrap();
+
+        merge_toml(&mut base, overlay);
+
+        // The overlay added its key and left the neighbours alone.
+        let tools = base.get("tools").unwrap().get("web-search").unwrap();
+        assert_eq!(tools.get("api_key").unwrap().as_str(), Some("secret"));
+        assert_eq!(tools.get("timeout").unwrap().as_integer(), Some(30));
+        assert_eq!(
+            base.get("llm").unwrap().get("model").unwrap().as_str(),
+            Some("a/b")
+        );
+    }
+
+    #[test]
+    fn overlay_replaces_scalars_and_arrays_rather_than_merging_them() {
+        let mut base: toml::Value =
+            toml::from_str("[build]
+locked = true
+allowed_crates = [\"a\", \"b\"]
+").unwrap();
+        let overlay: toml::Value =
+            toml::from_str("[build]
+locked = false
+allowed_crates = [\"c\"]
+").unwrap();
+
+        merge_toml(&mut base, overlay);
+
+        let build = base.get("build").unwrap();
+        assert_eq!(build.get("locked").unwrap().as_bool(), Some(false));
+        // Replaced, not appended: otherwise a list could never be shortened.
+        let crates = build.get("allowed_crates").unwrap().as_array().unwrap();
+        assert_eq!(crates.len(), 1);
+        assert_eq!(crates[0].as_str(), Some("c"));
     }
 }

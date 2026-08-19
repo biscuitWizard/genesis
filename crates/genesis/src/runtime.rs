@@ -12,7 +12,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use wasmtime::component::{HasSelf, Linker, ResourceTable};
 use wasmtime::{Config as WasmConfig, Engine, Store, StoreLimits, StoreLimitsBuilder, UpdateDeadline};
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
+use wasmtime_wasi_http::WasiHttpCtx;
 
 use crate::bindings;
 use crate::config::Config;
@@ -98,6 +100,9 @@ impl Budget {
 
 pub struct HostState {
     wasi: WasiCtx,
+    http: WasiHttpCtx,
+    /// The crate's no-op hook set; we do not customise wasi:http behaviour.
+    http_hooks: [(); 0],
     table: ResourceTable,
     limits: StoreLimits,
     pub harness: Arc<Harness>,
@@ -117,6 +122,16 @@ impl WasiView for HostState {
         WasiCtxView {
             ctx: &mut self.wasi,
             table: &mut self.table,
+        }
+    }
+}
+
+impl WasiHttpView for HostState {
+    fn http(&mut self) -> WasiHttpCtxView<'_> {
+        WasiHttpCtxView {
+            ctx: &mut self.http,
+            table: &mut self.table,
+            hooks: &mut self.http_hooks,
         }
     }
 }
@@ -191,10 +206,9 @@ impl Runtime {
         };
 
         let state = HostState {
-            // Guests get no ambient WASI capabilities: no preopened
-            // directories, no sockets, no inherited stdio. Everything they can
-            // do flows through the genesis imports.
-            wasi: WasiCtxBuilder::new().build(),
+            wasi: self.wasi_ctx(),
+            http: WasiHttpCtx::new(),
+            http_hooks: [],
             table: ResourceTable::new(),
             limits: StoreLimitsBuilder::new()
                 .memory_size(memory_cap)
@@ -220,6 +234,50 @@ impl Runtime {
     }
 }
 
+impl Runtime {
+    /// The WASI capabilities a guest is handed, per configuration.
+    ///
+    /// Anything not granted here is not merely restricted, it is absent: WASI
+    /// preview 2 gives a guest nothing by default, so an ungranted capability
+    /// shows up as a runtime error rather than a link failure.
+    fn wasi_ctx(&self) -> WasiCtx {
+        let mut builder = WasiCtxBuilder::new();
+        let wasi = &self.cfg.wasi;
+
+        if wasi.network {
+            builder.inherit_network();
+        }
+        builder.allow_ip_name_lookup(wasi.dns);
+        if wasi.env {
+            builder.inherit_env();
+        }
+        if wasi.stdio {
+            builder.inherit_stdio();
+        }
+
+        for dir in &wasi.dirs {
+            // A preopen has to exist before it can be handed over, and a
+            // missing one would otherwise fail every single call.
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                tracing::warn!(dir = %dir.display(), error = %e, "skipping wasi preopen");
+                continue;
+            }
+            let guest_name = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "workspace".to_string());
+
+            if let Err(e) =
+                builder.preopened_dir(dir, &guest_name, DirPerms::all(), FilePerms::all())
+            {
+                tracing::warn!(dir = %dir.display(), error = %e, "skipping wasi preopen");
+            }
+        }
+
+        builder.build()
+    }
+}
+
 /// A plain fn rather than a closure: the linker needs a higher-ranked
 /// signature that closure inference will not produce on its own.
 fn host_state(state: &mut HostState) -> &mut HostState {
@@ -231,6 +289,13 @@ fn build_linker(engine: &Engine, caps: Caps) -> Result<Linker<HostState>> {
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)
         .map_err(anyhow::Error::from)
         .context("linking wasi")?;
+
+    // `wasi:http` is what makes a web-facing tool possible at all. TLS is
+    // terminated here rather than in the guest, because no TLS crate builds for
+    // wasm32-wasip2: ring and openssl both need a C toolchain targeting wasm.
+    wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
+        .map_err(anyhow::Error::from)
+        .context("linking wasi:http")?;
 
     bindings::sys::add_to_linker::<_, HasSelf<_>>(&mut linker, host_state)?;
 
