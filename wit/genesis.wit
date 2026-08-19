@@ -237,6 +237,15 @@ interface types {
     detail: string,
   }
 
+  /// A registry dependency of a guest crate.
+  record dependency {
+    name: string,
+    /// A cargo version requirement: "1", "0.4.31", "^1.2".
+    version: string,
+    features: list<string>,
+    default-features: bool,
+  }
+
   record revision-info {
     slot: string,
     revision: u64,
@@ -428,13 +437,24 @@ interface configuration {
 // The self-development kit. Every mutating call rebuilds the target slot and
 // returns the compiler's verdict inline.
 interface devkit {
-  use types.{compile-report, mod-target, rollback-target, revision-info};
+  use types.{compile-report, mod-target, rollback-target, revision-info, dependency};
 
   new-tool: func(name: string, description: string) -> compile-report;
   write-file: func(target: mod-target, path: string, contents: string) -> compile-report;
   patch-file: func(target: mod-target, path: string, old-text: string, new-text: string) -> compile-report;
   read-file: func(target: mod-target, path: string) -> result<string, string>;
   list-files: func(target: mod-target) -> result<list<string>, string>;
+
+  /// Add a crate to a component's dependencies, then rebuild it.
+  ///
+  /// Adding a dependency makes cargo reach the network, so this can take far
+  /// longer than an ordinary edit; the build is killed if it overruns the
+  /// configured timeout and the previous revision keeps serving.
+  add-dependency: func(target: mod-target, dep: dependency) -> compile-report;
+  /// Drop a dependency and rebuild. Refuses to remove one the component needs
+  /// in order to be a component at all.
+  remove-dependency: func(target: mod-target, name: string) -> compile-report;
+  list-dependencies: func(target: mod-target) -> result<list<dependency>, string>;
 
   rollback: func(target: rollback-target, revision: option<u64>) -> result<string, string>;
   history: func(target: rollback-target) -> list<revision-info>;

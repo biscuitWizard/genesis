@@ -6,8 +6,8 @@
 //! flip and the tools appear without the agent needing to change.
 
 use crate::genesis::harness::types::{
-    CompileReport, ConfigEntry, ExecResult, FsEntry, LogLevel, ModTarget, RollbackTarget,
-    TerminalOutput, ToolManifest,
+    CompileReport, ConfigEntry, Dependency, ExecResult, FsEntry, LogLevel, ModTarget,
+    RollbackTarget, TerminalOutput, ToolManifest,
 };
 use crate::genesis::harness::{
     configuration, control, devkit, hostfs, sandbox, sys, terminal, tooling,
@@ -419,6 +419,50 @@ fn devkit_tools() -> Vec<ToolDef> {
             ),
         },
         ToolDef {
+            name: "add_dependency",
+            description:
+                "Add a crate from crates.io to a component's dependencies, then rebuild it. Any \
+                 published crate that supports wasm32-wasip2 will work; pure-computation crates \
+                 almost always do. This fetches over the network, so it is slower than an \
+                 ordinary edit. If the build fails the manifest is put back as it was.",
+            mutating: true,
+            parameters: obj(
+                json!({
+                    "target": target_prop,
+                    "name": string_prop("Crate name as published, e.g. 'regex'."),
+                    "version": string_prop("Version requirement, e.g. '1' or '0.4.31'."),
+                    "features": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Cargo features to enable. Omit for none.",
+                    },
+                    "default_features": {
+                        "type": "boolean",
+                        "description": "Keep the crate's default features. Defaults to true.",
+                    },
+                }),
+                &["target", "name", "version"],
+            ),
+        },
+        ToolDef {
+            name: "remove_dependency",
+            description: "Drop a crate from a component's dependencies and rebuild it.",
+            mutating: true,
+            parameters: obj(
+                json!({
+                    "target": target_prop,
+                    "name": string_prop("Crate name to remove."),
+                }),
+                &["target", "name"],
+            ),
+        },
+        ToolDef {
+            name: "list_dependencies",
+            description: "List the crates a component currently depends on.",
+            mutating: false,
+            parameters: obj(json!({ "target": target_prop }), &["target"]),
+        },
+        ToolDef {
             name: "read_code",
             description: "Read one of your own source files.",
             mutating: false,
@@ -590,6 +634,44 @@ pub fn invoke(
             &req_str(&args, "old_text")?,
             &req_str(&args, "new_text")?,
         ))),
+        "add_dependency" => Ok(format_report(devkit::add_dependency(
+            &parse_mod_target(&req_str(&args, "target")?)?,
+            &Dependency {
+                name: req_str(&args, "name")?,
+                version: req_str(&args, "version")?,
+                features: args
+                    .get("features")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(String::from)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                default_features: args
+                    .get("default_features")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+            },
+        ))),
+        "remove_dependency" => Ok(format_report(devkit::remove_dependency(
+            &parse_mod_target(&req_str(&args, "target")?)?,
+            &req_str(&args, "name")?,
+        ))),
+        "list_dependencies" => {
+            let deps = devkit::list_dependencies(&parse_mod_target(&req_str(&args, "target")?)?)?;
+            if deps.is_empty() {
+                return Ok("no dependencies".to_string());
+            }
+            Ok(deps
+                .iter()
+                .map(format_dependency)
+                .collect::<Vec<_>>()
+                .join("\n"))
+        }
+
         "read_code" => devkit::read_file(
             &parse_mod_target(&req_str(&args, "target")?)?,
             &req_str(&args, "path")?,
@@ -831,6 +913,18 @@ fn format_setting(entry: &ConfigEntry) -> String {
         line.push_str("   [read-only]");
     } else if !entry.live {
         line.push_str("   [needs restart]");
+    }
+    line
+}
+
+/// One dependency on a line, in the shape it takes in the manifest.
+fn format_dependency(dep: &Dependency) -> String {
+    let mut line = format!("{} = \"{}\"", dep.name, dep.version);
+    if !dep.features.is_empty() {
+        line.push_str(&format!("   features: {}", dep.features.join(", ")));
+    }
+    if !dep.default_features {
+        line.push_str("   [no default features]");
     }
     line
 }

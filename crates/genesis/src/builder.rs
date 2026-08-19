@@ -37,6 +37,17 @@ impl BuildOutcome {
     }
 }
 
+/// How a build should treat the lockfile.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BuildOptions {
+    /// Let cargo update `Cargo.lock`.
+    ///
+    /// Required after a manifest change: `--locked` fails outright when the
+    /// lockfile no longer matches the dependencies, so adding a crate would
+    /// never build without this.
+    pub refresh_lockfile: bool,
+}
+
 /// Serializes builds so a shared cargo target directory is never contended.
 #[derive(Default)]
 pub struct Builder {
@@ -60,6 +71,15 @@ impl Builder {
     }
 
     pub async fn build(&self, cfg: &Config, slot: &Slot) -> Result<BuildOutcome> {
+        self.build_with(cfg, slot, BuildOptions::default()).await
+    }
+
+    pub async fn build_with(
+        &self,
+        cfg: &Config,
+        slot: &Slot,
+        opts: BuildOptions,
+    ) -> Result<BuildOutcome> {
         let _guard = self.lock.lock().await;
         let started = Instant::now();
 
@@ -90,15 +110,28 @@ impl Builder {
 
         // `--locked` keeps dependency resolution reproducible, but only once a
         // lockfile exists; a freshly scaffolded tool has to generate one first.
-        if cfg.build.locked && src.join("Cargo.lock").is_file() {
+        if cfg.build.locked && !opts.refresh_lockfile && src.join("Cargo.lock").is_file() {
             cmd.arg("--locked");
         }
         cmd.args(&cfg.build.extra_args);
 
-        let output = cmd
-            .output()
-            .await
-            .with_context(|| format!("running cargo for {slot}"))?;
+        // Dropping the future kills the child, which is what makes the timeout
+        // below actually release the lock rather than leak a running cargo.
+        cmd.kill_on_drop(true);
+
+        let output = match tokio::time::timeout(cfg.build.timeout, cmd.output()).await {
+            Ok(result) => result.with_context(|| format!("running cargo for {slot}"))?,
+            Err(_) => {
+                let secs = cfg.build.timeout.as_secs();
+                tracing::warn!(%slot, secs, "build exceeded its timeout and was killed");
+                return Ok(BuildOutcome::failed(
+                    format!(
+                        "the build ran longer than {secs}s and was stopped. This usually means a                          dependency could not be fetched. The previous revision is still serving."
+                    ),
+                    started.elapsed(),
+                ));
+            }
+        };
 
         let duration = started.elapsed();
         let stderr = trim_diagnostics(&String::from_utf8_lossy(&output.stderr));

@@ -18,6 +18,7 @@ pub mod hostfs;
 pub mod host_api;
 pub mod llm;
 pub mod loader;
+pub mod manifest;
 pub mod pipeline;
 pub mod revisions;
 pub mod runtime;

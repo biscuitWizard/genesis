@@ -24,8 +24,8 @@ fn err(msg: impl Into<String>) -> wasmtime::Error {
 }
 
 use crate::bindings::types::{
-    Attachment, CompileReport, ConfigEntry, EventRecord, ExecResult, FsEntry, InboxItem, LlmError,
-    LogLevel, ModeInfo, ModTarget, ModelInfo, RevisionInfo, RollbackTarget, SessionEvent,
+    Attachment, CompileReport, ConfigEntry, Dependency, EventRecord, ExecResult, FsEntry, InboxItem,
+    LlmError, LogLevel, ModeInfo, ModTarget, ModelInfo, RevisionInfo, RollbackTarget, SessionEvent,
     SessionMeta, SkillInfo, StreamChunk, TerminalInfo, TerminalOutput, ToolManifest,
 };
 use crate::bindings::{
@@ -523,6 +523,55 @@ impl devkit::Host for HostState {
         self.yielded();
         self.note_pending_swap(&target);
         Ok(report)
+    }
+
+    async fn add_dependency(
+        &mut self,
+        target: ModTarget,
+        dep: Dependency,
+    ) -> Result<CompileReport> {
+        let harness = self.harness.clone();
+        let dep = crate::manifest::Dependency {
+            name: dep.name,
+            version: dep.version,
+            features: dep.features,
+            default_features: dep.default_features,
+        };
+        let report = crate::devkit::add_dependency(&harness, &target, &dep).await;
+        self.yielded();
+        self.note_pending_swap(&target);
+        Ok(report)
+    }
+
+    async fn remove_dependency(
+        &mut self,
+        target: ModTarget,
+        name: String,
+    ) -> Result<CompileReport> {
+        let harness = self.harness.clone();
+        let report = crate::devkit::remove_dependency(&harness, &target, &name).await;
+        self.yielded();
+        self.note_pending_swap(&target);
+        Ok(report)
+    }
+
+    async fn list_dependencies(
+        &mut self,
+        target: ModTarget,
+    ) -> Result<std::result::Result<Vec<Dependency>, String>> {
+        let harness = self.harness.clone();
+        Ok(
+            crate::devkit::list_dependencies(&harness, &target).map(|deps| {
+                deps.into_iter()
+                    .map(|d| Dependency {
+                        name: d.name,
+                        version: d.version,
+                        features: d.features,
+                        default_features: d.default_features,
+                    })
+                    .collect()
+            }),
+        )
     }
 
     async fn read_file(

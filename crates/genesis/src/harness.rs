@@ -83,6 +83,27 @@ pub struct Harness {
     /// validated. Cached because the agent reads the whole list on every loop
     /// iteration, and calling into each tool for it would be wasteful.
     tool_manifests: std::sync::RwLock<std::collections::HashMap<String, ToolManifest>>,
+    /// Slots with a build in flight.
+    ///
+    /// Builds serialize on one lock, so an agent that keeps asking for the same
+    /// slot would otherwise queue work behind a build that is already going to
+    /// supersede it. Refusing the duplicate keeps the queue bounded no matter
+    /// how the agent loops.
+    building: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+/// Marks a slot as building for as long as it is held.
+pub struct BuildGuard {
+    harness: Arc<Harness>,
+    slot: String,
+}
+
+impl Drop for BuildGuard {
+    fn drop(&mut self) {
+        if let Ok(mut in_flight) = self.harness.building.lock() {
+            in_flight.remove(&self.slot);
+        }
+    }
 }
 
 impl Harness {
@@ -113,7 +134,20 @@ impl Harness {
             ),
             watch_suppressed_until: std::sync::Mutex::new(std::collections::HashMap::new()),
             tool_manifests: std::sync::RwLock::new(std::collections::HashMap::new()),
+            building: std::sync::Mutex::new(std::collections::HashSet::new()),
         }))
+    }
+
+    /// Claims the right to build a slot, or `None` if one is already running.
+    pub fn begin_build(self: &Arc<Self>, slot: &Slot) -> Option<BuildGuard> {
+        let mut in_flight = self.building.lock().ok()?;
+        if !in_flight.insert(slot.key()) {
+            return None;
+        }
+        Some(BuildGuard {
+            harness: self.clone(),
+            slot: slot.key(),
+        })
     }
 
     // --- events ------------------------------------------------------------

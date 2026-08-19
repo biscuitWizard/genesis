@@ -135,6 +135,14 @@ target_dir = "target-wasm"
 # reproducible for builds the agent triggers.
 locked = true
 extra_args = []
+# Ceiling on a single cargo invocation. Builds are serialized, so one that hangs
+# would block every later build; this kills it and reports a failed compile
+# instead. Raise it if a genuinely large dependency tree is being fetched.
+timeout_secs = 900
+# Crates guests are allowed to depend on. Empty means anything on crates.io.
+# Populate it to restrict what the agent can pull in, e.g.
+#   allowed_crates = ["regex", "serde", "chrono"]
+allowed_crates = []
 
 [watchdog]
 # Failures inside this window count toward the same circuit breaker.

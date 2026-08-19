@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use wasmtime::component::Component;
 
+use crate::builder::BuildOptions;
 use crate::harness::Harness;
 use crate::loader::Loader;
 use crate::revisions::{Origin, Status};
@@ -56,10 +57,32 @@ pub async fn build_and_activate(
     origin: Origin,
     note: &str,
 ) -> Result<Outcome> {
+    build_and_activate_with(harness, slot, origin, note, BuildOptions::default()).await
+}
+
+/// As [`build_and_activate`], with control over how cargo is invoked.
+pub async fn build_and_activate_with(
+    harness: &Arc<Harness>,
+    slot: &Slot,
+    origin: Origin,
+    note: &str,
+    opts: BuildOptions,
+) -> Result<Outcome> {
     let started = Instant::now();
 
+    // A build already running for this slot will pick up the same source tree,
+    // so waiting for the lock only to repeat it is wasted work.
+    let Some(_in_flight) = harness.begin_build(slot) else {
+        return Ok(Outcome::failure(
+            slot,
+            "a build for this slot is already running; its result will cover this change too",
+            String::new(),
+            started,
+        ));
+    };
+
     // 1. Compile.
-    let build = harness.builder.build(&harness.cfg, slot).await?;
+    let build = harness.builder.build_with(&harness.cfg, slot, opts).await?;
     if !build.success {
         return Ok(Outcome::failure(
             slot,

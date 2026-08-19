@@ -90,6 +90,14 @@ pub struct BuildSettings {
     /// Pass `--locked` when a lockfile exists, keeping resolution reproducible.
     pub locked: bool,
     pub extra_args: Vec<String>,
+    /// How long a single cargo invocation may run before it is killed.
+    ///
+    /// Builds hold a process-wide lock, so one that never returns - a stalled
+    /// crates.io fetch, a dependency's `build.rs` waiting on input - would wedge
+    /// every future build permanently. This is the backstop for that.
+    pub timeout: Duration,
+    /// Crates a guest may depend on. Empty means no restriction.
+    pub allowed_crates: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -523,6 +531,8 @@ mod spec {
         pub target_dir: String,
         pub locked: bool,
         pub extra_args: Vec<String>,
+        pub timeout_secs: u64,
+        pub allowed_crates: Vec<String>,
     }
     impl Default for Build {
         fn default() -> Self {
@@ -533,6 +543,10 @@ mod spec {
                 target_dir: "target-wasm".into(),
                 locked: true,
                 extra_args: Vec::new(),
+                // Generous: a cold build that fetches a large dependency tree
+                // is slow but legitimate. This only catches genuine hangs.
+                timeout_secs: 900,
+                allowed_crates: Vec::new(),
             }
         }
     }
@@ -866,6 +880,10 @@ impl Config {
                 target_dir: resolve(&root, &file.build.target_dir),
                 locked: file.build.locked,
                 extra_args: file.build.extra_args,
+                timeout: Duration::from_secs(
+                    env_parse("GENESIS_BUILD_TIMEOUT_SECS", file.build.timeout_secs).max(1),
+                ),
+                allowed_crates: file.build.allowed_crates,
             },
 
             watchdog: WatchdogSettings {

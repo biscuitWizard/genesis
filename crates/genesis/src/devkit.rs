@@ -260,6 +260,107 @@ pub async fn patch_file(
     build(harness, &slot, Origin::AgentMod, &format!("patched {path}")).await
 }
 
+/// Adds a crate to a component's dependencies and rebuilds it.
+///
+/// The rebuild deliberately runs without `--locked`: the lockfile cannot match
+/// a manifest that just gained an entry, so insisting on it would fail every
+/// time. Reproducibility is restored as soon as cargo rewrites the lock.
+pub async fn add_dependency(
+    harness: &Arc<Harness>,
+    target: &ModTarget,
+    dep: &crate::manifest::Dependency,
+) -> CompileReport {
+    let slot = match slot_with_source(harness, target) {
+        Ok(slot) => slot,
+        Err(report) => return report,
+    };
+    let dir = harness.cfg.slot_source_dir(&slot);
+
+    // Keep the manifest as it was, so a dependency that does not resolve can be
+    // rolled back out rather than leaving the crate unbuildable.
+    let restore = std::fs::read_to_string(dir.join("Cargo.toml")).ok();
+
+    if let Err(e) = crate::manifest::add(&dir, dep, &harness.cfg.build.allowed_crates) {
+        return report_error(&slot.key(), format!("{e:#}"));
+    }
+
+    let note = format!("added dependency {} {}", dep.name, dep.version);
+    let report = build_deps(harness, &slot, &note).await;
+
+    if !report.success {
+        if let Some(text) = restore {
+            let _ = std::fs::write(dir.join("Cargo.toml"), text);
+        }
+    }
+    report
+}
+
+/// Removes a dependency and rebuilds.
+pub async fn remove_dependency(
+    harness: &Arc<Harness>,
+    target: &ModTarget,
+    name: &str,
+) -> CompileReport {
+    let slot = match slot_with_source(harness, target) {
+        Ok(slot) => slot,
+        Err(report) => return report,
+    };
+    let dir = harness.cfg.slot_source_dir(&slot);
+    let restore = std::fs::read_to_string(dir.join("Cargo.toml")).ok();
+
+    if let Err(e) = crate::manifest::remove(&dir, name) {
+        return report_error(&slot.key(), format!("{e:#}"));
+    }
+
+    let report = build_deps(harness, &slot, &format!("removed dependency {name}")).await;
+    if !report.success {
+        if let Some(text) = restore {
+            let _ = std::fs::write(dir.join("Cargo.toml"), text);
+        }
+    }
+    report
+}
+
+pub fn list_dependencies(
+    harness: &Arc<Harness>,
+    target: &ModTarget,
+) -> std::result::Result<Vec<crate::manifest::Dependency>, String> {
+    let slot = target_to_slot(target).map_err(|e| format!("{e:#}"))?;
+    let dir = harness.cfg.slot_source_dir(&slot);
+    crate::manifest::list(&dir).map_err(|e| format!("{e:#}"))
+}
+
+/// A rebuild that is allowed to refresh the lockfile.
+async fn build_deps(harness: &Arc<Harness>, slot: &Slot, note: &str) -> CompileReport {
+    harness.suppress_watch(slot, harness.cfg.watchdog.watch_suppression);
+
+    let opts = crate::builder::BuildOptions {
+        refresh_lockfile: true,
+    };
+    match pipeline::build_and_activate_with(harness, slot, Origin::AgentMod, note, opts).await {
+        Ok(outcome) => report_from(outcome),
+        Err(e) => report_error(&slot.key(), format!("build pipeline failed: {e:#}")),
+    }
+}
+
+/// Resolves a target to a slot that actually has a crate on disk.
+fn slot_with_source(
+    harness: &Arc<Harness>,
+    target: &ModTarget,
+) -> std::result::Result<Slot, CompileReport> {
+    let slot = match target_to_slot(target) {
+        Ok(s) => s,
+        Err(e) => return Err(report_error("unknown", format!("{e:#}"))),
+    };
+    if !harness.cfg.slot_source_dir(&slot).join("Cargo.toml").is_file() {
+        return Err(report_error(
+            &slot.key(),
+            format!("{slot} has no crate on disk"),
+        ));
+    }
+    Ok(slot)
+}
+
 pub fn read_file(
     harness: &Arc<Harness>,
     target: &ModTarget,
