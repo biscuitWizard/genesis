@@ -1,0 +1,513 @@
+// ---------------------------------------------------------------------------
+// Genesis harness contract.
+//
+// This file is the boundary between the trusted orchestrator (host) and every
+// hot-loaded guest (agent, gateways, tools). Guests hold NO ambient authority:
+// everything they can observe or affect is an import declared here.
+//
+// Changing this file forces a rebuild of every guest, so it is orchestrator-
+// owned: the dev-kit refuses agent writes that touch it.
+// ---------------------------------------------------------------------------
+package genesis:harness@0.1.0;
+
+interface types {
+  // --- accounting -----------------------------------------------------------
+  record token-usage {
+    prompt-tokens: u32,
+    completion-tokens: u32,
+    cost-usd: f64,
+    /// Prompt tokens served from the provider's cache rather than re-read.
+    cached-tokens: u32,
+    /// Prompt tokens written into the cache by this request.
+    cache-write-tokens: u32,
+  }
+
+  // --- conversation ---------------------------------------------------------
+
+  /// A file the user attached to a message.
+  ///
+  /// Contents stay base64-encoded end to end: the browser produces them that
+  /// way and the model API consumes them that way, so nothing has to re-encode
+  /// on the path between.
+  record attachment {
+    name: string,
+    mime: string,
+    data-base64: string,
+  }
+
+  record user-msg {
+    text: string,
+    attachments: list<attachment>,
+  }
+
+  record tool-call {
+    id: string,
+    name: string,
+    arguments-json: string,
+  }
+
+  record tool-outcome {
+    call-id: string,
+    name: string,
+    ok: bool,
+    content: string,
+  }
+
+  record assistant-msg {
+    content: string,
+    tool-calls: list<tool-call>,
+    model: string,
+    usage: option<token-usage>,
+  }
+
+  record turn-stats {
+    iterations: u32,
+    prompt-tokens: u32,
+    completion-tokens: u32,
+    cost-usd: f64,
+    tools-used: list<string>,
+    stopped-by: string,
+  }
+
+  record mod-result {
+    slot: string,
+    revision: option<u64>,
+    success: bool,
+    detail: string,
+  }
+
+  // One entry in a session's append-only log. `stream-delta` is the sole
+  // transient case: it is rendered to clients but never persisted.
+  variant session-event {
+    user-message(user-msg),
+    assistant-message(assistant-msg),
+    tool-invocation(tool-call),
+    tool-result(tool-outcome),
+    nudge(string),
+    system-note(string),
+    modification(mod-result),
+    incident(string),
+    turn-started,
+    turn-finished(turn-stats),
+    stream-delta(string),
+  }
+
+  record event-record {
+    seq: u64,
+    ts-ms: u64,
+    event: session-event,
+  }
+
+  record session-meta {
+    id: string,
+    title: string,
+    created-ms: u64,
+    updated-ms: u64,
+    event-count: u64,
+    archived: bool,
+    preview: string,
+    /// How the agent should behave in this session, e.g. "agent" or "plan".
+    mode: string,
+    /// Model override for this session; empty means the harness default.
+    model: string,
+  }
+
+  /// A model the user may pick for a session.
+  record model-info {
+    id: string,
+    label: string,
+  }
+
+  /// A named set of instructions that can be attached to a conversation to
+  /// shape how the agent works. Discovered from `skills/*.md`.
+  record skill-info {
+    id: string,
+    name: string,
+    description: string,
+    instructions: string,
+    /// Whether this skill is attached to the session it was listed for.
+    enabled: bool,
+  }
+
+  /// A way of working the user may pick for a session. The agent interprets
+  /// the id; the harness only carries it.
+  record mode-info {
+    id: string,
+    label: string,
+    description: string,
+    /// Whether tools that change things are withheld. The agent reads this
+    /// rather than knowing any mode by name, so a new mode is configuration.
+    read-only: bool,
+  }
+
+  // Delivered to the gateway for rendering. `seq` is none for transient events.
+  record outbound-event {
+    session-id: string,
+    seq: option<u64>,
+    ts-ms: u64,
+    event: session-event,
+  }
+
+  // --- mid-turn control -----------------------------------------------------
+  variant inbox-item {
+    nudge(string),
+    cancel,
+    control(string),
+  }
+
+  // --- llm ------------------------------------------------------------------
+  record finish-info {
+    reason: string,
+    usage: option<token-usage>,
+    model: string,
+  }
+
+  variant stream-chunk {
+    delta(string),
+    tool-calls(list<tool-call>),
+    finished(finish-info),
+  }
+
+  variant llm-error {
+    auth(string),
+    rate-limited(string),
+    transport(string),
+    model-error(string),
+    budget(string),
+    bad-request(string),
+  }
+
+  // --- host filesystem ------------------------------------------------------
+  record fs-entry {
+    name: string,
+    /// Path relative to the root it was listed under.
+    path: string,
+    is-dir: bool,
+    size: u64,
+  }
+
+  // --- terminals ------------------------------------------------------------
+  record terminal-output {
+    output: string,
+    timed-out: bool,
+    truncated: bool,
+  }
+
+  record terminal-info {
+    id: string,
+    cwd: string,
+    shell: string,
+    alive: bool,
+    /// Commands run in this session so far.
+    commands: u32,
+  }
+
+  // --- execution ------------------------------------------------------------
+  record exec-result {
+    exit-code: s32,
+    stdout: string,
+    stderr: string,
+    timed-out: bool,
+    truncated: bool,
+  }
+
+  // --- code modification ----------------------------------------------------
+  variant mod-target {
+    agent-self,
+    tool(string),
+    gateway(string),
+  }
+
+  variant rollback-target {
+    agent-self,
+    tool(string),
+    gateway(string),
+    whole-system,
+  }
+
+  // Returned inline from every mutating dev-kit call so the model sees the
+  // compiler's verdict in the same loop iteration that made the edit.
+  record compile-report {
+    success: bool,
+    slot: string,
+    revision: option<u64>,
+    stderr: string,
+    duration-ms: u64,
+    pending-swap: bool,
+    detail: string,
+  }
+
+  record revision-info {
+    slot: string,
+    revision: u64,
+    status: string,
+    origin: string,
+    note: string,
+    created-ms: u64,
+  }
+
+  // --- configuration --------------------------------------------------------
+  record config-entry {
+    /// Dotted path, e.g. "llm.model".
+    key: string,
+    /// Current value, or "***" where the setting holds a secret.
+    value: string,
+    /// Whether `set` will accept a change to it.
+    editable: bool,
+    /// Whether the running process would pick a change up without a restart.
+    live: bool,
+  }
+
+  // --- manifests ------------------------------------------------------------
+  record tool-manifest {
+    name: string,
+    description: string,
+    args-schema-json: string,
+    capabilities: list<string>,
+  }
+
+  record agent-manifest {
+    name: string,
+    version-note: string,
+    skills: list<string>,
+  }
+
+  record gateway-manifest {
+    name: string,
+    version-note: string,
+  }
+
+  record asset {
+    mime: string,
+    bytes: list<u8>,
+  }
+
+  enum log-level { trace, debug, info, warn, error }
+}
+
+// ---------------------------------------------------------------------------
+// Host interfaces
+// ---------------------------------------------------------------------------
+
+interface sys {
+  use types.{log-level, model-info, mode-info};
+
+  log: func(level: log-level, msg: string);
+  now-ms: func() -> u64;
+  // Namespaced scratch storage. `scope` is "global" or a session id.
+  kv-get: func(scope: string, key: string) -> option<string>;
+  kv-put: func(scope: string, key: string, value: string);
+  // Orchestrator-owned configuration the guest may read (never secrets).
+  config-get: func(key: string) -> option<string>;
+
+  // Catalogues the chat surface offers the user.
+  list-models: func() -> list<model-info>;
+  list-modes: func() -> list<mode-info>;
+}
+
+interface session {
+  use types.{attachment, event-record, session-event, session-meta, inbox-item,
+             skill-info, tool-manifest};
+
+  events: func(session-id: string, from-seq: u64) -> list<event-record>;
+  append: func(session-id: string, event: session-event) -> u64;
+  // Streams a token fragment to connected clients without persisting it.
+  emit-output: func(session-id: string, chunk: string);
+  // Drains mid-turn user input (nudges / cancel) so a running turn can steer.
+  poll-inbox: func(session-id: string) -> list<inbox-item>;
+
+  list-sessions: func(include-archived: bool) -> list<session-meta>;
+  get-session: func(session-id: string) -> option<session-meta>;
+  create-session: func(title: option<string>) -> string;
+  rename-session: func(session-id: string, title: string);
+  archive-session: func(session-id: string, archived: bool);
+  // Routes a user message into a session actor, starting or nudging a turn.
+  submit: func(session-id: string, message: string, attachments: list<attachment>);
+  set-session-mode: func(session-id: string, mode: string);
+  set-session-model: func(session-id: string, model: string);
+
+  // Skills attached to a conversation, with each one's enabled state resolved.
+  list-skills: func(session-id: string) -> list<skill-info>;
+  set-skill-enabled: func(session-id: string, skill-id: string, enabled: bool);
+
+  // Exactly the tools the agent would offer the model for this session, asked
+  // of the agent itself so the answer cannot drift from what it really does.
+  available-tools: func(session-id: string) -> list<tool-manifest>;
+}
+
+interface llm {
+  use types.{stream-chunk, llm-error};
+
+  // Non-streaming convenience call; returns the raw provider JSON response.
+  chat: func(request-json: string) -> result<string, llm-error>;
+
+  // Streaming: open once, then pull chunks until `finished`. The host owns the
+  // socket, accumulates partial tool-call deltas, and enforces spend ceilings.
+  stream-open: func(request-json: string) -> result<u64, llm-error>;
+  stream-next: func(stream-id: u64) -> result<stream-chunk, llm-error>;
+  stream-close: func(stream-id: u64);
+}
+
+interface sandbox {
+  use types.{exec-result};
+
+  // Runs a command inside the session's Docker container. Never on the host.
+  exec: func(session-id: string, command: string, stdin: option<string>, timeout-ms: u32) -> exec-result;
+  write-file: func(session-id: string, path: string, contents: string) -> result<_, string>;
+  read-file: func(session-id: string, path: string) -> result<string, string>;
+  list-files: func(session-id: string, path: string) -> result<list<string>, string>;
+  available: func() -> bool;
+}
+
+interface tooling {
+  use types.{tool-manifest};
+
+  // Hot-loaded tool components currently active in the registry.
+  registry: func() -> list<tool-manifest>;
+  invoke: func(name: string, session-id: string, args-json: string) -> result<string, string>;
+
+  mcp-list-tools: func() -> list<tool-manifest>;
+  mcp-call-tool: func(name: string, args-json: string) -> result<string, string>;
+}
+
+// The host filesystem, confined to the roots named in configuration.
+//
+// This is separate from `sandbox`, which runs code in a container. These
+// operations touch the machine the orchestrator is running on, so the whole
+// interface is off unless configuration turns it on.
+interface hostfs {
+  use types.{fs-entry};
+
+  available: func() -> bool;
+  read-file: func(path: string) -> result<string, string>;
+  write-file: func(path: string, contents: string) -> result<string, string>;
+  list-dir: func(path: string) -> result<list<fs-entry>, string>;
+  delete-path: func(path: string, recursive: bool) -> result<string, string>;
+}
+
+// Long-lived shell sessions on the host.
+//
+// A session keeps its working directory and shell state between commands,
+// which is what separates it from a one-shot exec.
+interface terminal {
+  use types.{terminal-output, terminal-info};
+
+  available: func() -> bool;
+  open: func(cwd: option<string>) -> result<string, string>;
+  run: func(id: string, command: string, timeout-ms: u32) -> result<terminal-output, string>;
+  read: func(id: string) -> result<string, string>;
+  close: func(id: string) -> result<string, string>;
+  sessions: func() -> list<terminal-info>;
+}
+
+// Control over the orchestrator process itself.
+interface control {
+  available: func() -> bool;
+  // Restarts the orchestrator shortly after the current turn ends, so the call
+  // returns and the user sees why before the process goes away.
+  //
+  // With `resume`, the interrupted turn is picked up again once the new process
+  // is serving; without it, the turn ends at the restart.
+  restart: func(reason: string, resume: bool) -> result<string, string>;
+}
+
+// Reading and changing the harness's own configuration.
+//
+// Writes go to the file the process was started from, with its comments
+// intact, and are rejected unless the result would still load. Nothing takes
+// effect until Genesis restarts.
+interface configuration {
+  use types.{config-entry};
+
+  // Every setting, optionally narrowed to those under a dotted prefix.
+  settings: func(prefix: option<string>) -> list<config-entry>;
+  get: func(key: string) -> option<config-entry>;
+  set: func(key: string, value: string) -> result<string, string>;
+}
+
+// The self-development kit. Every mutating call rebuilds the target slot and
+// returns the compiler's verdict inline.
+interface devkit {
+  use types.{compile-report, mod-target, rollback-target, revision-info};
+
+  new-tool: func(name: string, description: string) -> compile-report;
+  write-file: func(target: mod-target, path: string, contents: string) -> compile-report;
+  patch-file: func(target: mod-target, path: string, old-text: string, new-text: string) -> compile-report;
+  read-file: func(target: mod-target, path: string) -> result<string, string>;
+  list-files: func(target: mod-target) -> result<list<string>, string>;
+
+  rollback: func(target: rollback-target, revision: option<u64>) -> result<string, string>;
+  history: func(target: rollback-target) -> list<revision-info>;
+}
+
+// ---------------------------------------------------------------------------
+// Worlds
+// ---------------------------------------------------------------------------
+
+world agent {
+  use types.{turn-stats, agent-manifest, tool-manifest};
+
+  import sys;
+  import session;
+  import llm;
+  import sandbox;
+  import tooling;
+  import devkit;
+  import hostfs;
+  import terminal;
+  import control;
+  import configuration;
+
+  // Runs one full agentic turn for a session. The agent is stateless across
+  // turns: it rehydrates from the session log every time.
+  export handle-turn: func(session-id: string) -> result<turn-stats, string>;
+  // Liveness probe used by the watchdog and the validation gate.
+  export health: func() -> string;
+  export describe: func() -> agent-manifest;
+  // The tool surface for a given mode. The agent is the authority on this, so
+  // the chat interface asks rather than guessing.
+  export list-tools: func(mode: string) -> list<tool-manifest>;
+}
+
+world gateway {
+  use types.{asset, outbound-event, gateway-manifest};
+
+  import sys;
+  import session;
+
+  record broadcast-frame {
+    session-id: string,
+    frame: string,
+  }
+
+  variant gateway-action {
+    reply(string),
+    broadcast(broadcast-frame),
+    subscribe(string),
+    unsubscribe(string),
+  }
+
+  // Serves the embedded single-page UI. The host owns the socket; the gateway
+  // owns every byte the user sees.
+  export serve-asset: func(path: string) -> option<asset>;
+  export on-client-message: func(client-id: string, frame-json: string) -> list<gateway-action>;
+  export render-event: func(event: outbound-event) -> option<string>;
+  export describe: func() -> gateway-manifest;
+}
+
+world tool {
+  use types.{tool-manifest};
+
+  import sys;
+  import sandbox;
+
+  export describe: func() -> tool-manifest;
+  // `config-json` is the tool's own `[tools.<name>]` block from genesis.toml,
+  // or `{}` when it has none. A tool is handed its own settings and never sees
+  // another's, nor anything else in the configuration.
+  export invoke: func(
+    session-id: string,
+    args-json: string,
+    config-json: string,
+  ) -> result<string, string>;
+}

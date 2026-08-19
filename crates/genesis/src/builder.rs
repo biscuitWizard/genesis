@@ -1,0 +1,192 @@
+//! Compiling guest source trees to WebAssembly components.
+//!
+//! One serialized queue drives every build, whether it was triggered by a human
+//! editing a file or by the agent rewriting itself. Both paths therefore get the
+//! same validation and the same versioning guarantees.
+//!
+//! Builds use the host toolchain (`cargo build --target wasm32-wasip2`), which
+//! is fast but means build scripts and proc macros run with the orchestrator's
+//! privileges. The dev-kit compensates by refusing agent writes to `Cargo.toml`,
+//! `build.rs`, and `.cargo/` — dependencies stay a human decision.
+
+use anyhow::{Context, Result};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
+
+use crate::config::Config;
+use crate::slot::Slot;
+
+#[derive(Debug, Clone)]
+pub struct BuildOutcome {
+    pub success: bool,
+    /// Compiler diagnostics, trimmed to something a model can actually read.
+    pub stderr: String,
+    pub duration: Duration,
+    pub wasm_path: Option<PathBuf>,
+}
+
+impl BuildOutcome {
+    pub fn failed(stderr: impl Into<String>, duration: Duration) -> Self {
+        Self {
+            success: false,
+            stderr: stderr.into(),
+            duration,
+            wasm_path: None,
+        }
+    }
+}
+
+/// Serializes builds so a shared cargo target directory is never contended.
+#[derive(Default)]
+pub struct Builder {
+    lock: Mutex<()>,
+}
+
+impl Builder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Where cargo puts a slot's component. Sharing one target directory across
+    /// all guests means dependencies compile once, which is what keeps the
+    /// agent's edit-compile-fix loop tight.
+    pub fn wasm_path(cfg: &Config, slot: &Slot) -> PathBuf {
+        cfg.build
+            .target_dir
+            .join(&cfg.build.target)
+            .join(&cfg.build.profile)
+            .join(cfg.slot_wasm_filename(slot))
+    }
+
+    pub async fn build(&self, cfg: &Config, slot: &Slot) -> Result<BuildOutcome> {
+        let _guard = self.lock.lock().await;
+        let started = Instant::now();
+
+        let src = cfg.slot_source_dir(slot);
+        if !src.join("Cargo.toml").is_file() {
+            return Ok(BuildOutcome::failed(
+                format!("no crate found at {}", src.display()),
+                started.elapsed(),
+            ));
+        }
+
+        let mut cmd = tokio::process::Command::new(&cfg.build.command);
+        cmd.current_dir(&src)
+            .env("CARGO_TARGET_DIR", &cfg.build.target_dir)
+            // Plain, parseable diagnostics: this text goes to a language model.
+            .env("CARGO_TERM_COLOR", "never")
+            .arg("build")
+            .arg("--target")
+            .arg(&cfg.build.target);
+
+        // cargo spells the default profile `--release`, but any other profile
+        // is named with `--profile`.
+        if cfg.build.profile == "release" {
+            cmd.arg("--release");
+        } else if cfg.build.profile != "debug" {
+            cmd.arg("--profile").arg(&cfg.build.profile);
+        }
+
+        // `--locked` keeps dependency resolution reproducible, but only once a
+        // lockfile exists; a freshly scaffolded tool has to generate one first.
+        if cfg.build.locked && src.join("Cargo.lock").is_file() {
+            cmd.arg("--locked");
+        }
+        cmd.args(&cfg.build.extra_args);
+
+        let output = cmd
+            .output()
+            .await
+            .with_context(|| format!("running cargo for {slot}"))?;
+
+        let duration = started.elapsed();
+        let stderr = trim_diagnostics(&String::from_utf8_lossy(&output.stderr));
+
+        if !output.status.success() {
+            return Ok(BuildOutcome::failed(stderr, duration));
+        }
+
+        let wasm = Self::wasm_path(cfg, slot);
+        if !wasm.is_file() {
+            return Ok(BuildOutcome::failed(
+                format!(
+                    "cargo reported success but no component appeared at {}\n{stderr}",
+                    wasm.display()
+                ),
+                duration,
+            ));
+        }
+
+        Ok(BuildOutcome {
+            success: true,
+            stderr,
+            duration,
+            wasm_path: Some(wasm),
+        })
+    }
+}
+
+/// Cargo is chatty. Keep the errors and drop the progress noise, then cap the
+/// result so a pathological build cannot flood the model's context.
+fn trim_diagnostics(raw: &str) -> String {
+    const MAX: usize = 12_000;
+
+    let kept: Vec<&str> = raw
+        .lines()
+        .filter(|line| {
+            let t = line.trim_start();
+            !(t.starts_with("Compiling")
+                || t.starts_with("Downloaded")
+                || t.starts_with("Downloading")
+                || t.starts_with("Updating")
+                || t.starts_with("Finished")
+                || t.starts_with("Locking")
+                || t.starts_with("Adding"))
+        })
+        .collect();
+
+    let text = kept.join("\n").trim().to_string();
+    if text.len() <= MAX {
+        return text;
+    }
+
+    // Keep the head (the first errors are the ones worth fixing) and the tail
+    // (which carries the summary line).
+    let head: String = text.chars().take(MAX * 2 / 3).collect();
+    let tail: String = text
+        .chars()
+        .rev()
+        .take(MAX / 3)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{head}\n\n[... diagnostics truncated ...]\n\n{tail}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagnostics_drop_progress_noise_but_keep_errors() {
+        let raw = "   Compiling foo v0.1.0\n\
+                   error[E0425]: cannot find value `x`\n\
+                    --> src/lib.rs:3:5\n\
+                       Finished release profile\n";
+        let out = trim_diagnostics(raw);
+        assert!(out.contains("E0425"));
+        assert!(out.contains("src/lib.rs:3:5"));
+        assert!(!out.contains("Compiling"));
+        assert!(!out.contains("Finished"));
+    }
+
+    #[test]
+    fn diagnostics_are_capped() {
+        let raw = "error: boom\n".repeat(4000);
+        let out = trim_diagnostics(&raw);
+        assert!(out.len() < 14_000, "was {}", out.len());
+        assert!(out.contains("truncated"));
+    }
+}

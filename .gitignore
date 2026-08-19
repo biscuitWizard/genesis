@@ -1,0 +1,13 @@
+# Build output
+/target
+/target-wasm
+# Guest crates build into the shared target dir, but keep any stray local ones out.
+**/target/
+
+# Runtime state
+/data
+/artifacts
+
+# Local configuration, which is where a real API key belongs.
+genesis.local.toml
+*.local.toml

@@ -1,0 +1,51 @@
+[package]
+name = "genesis"
+# The package ships a second binary (the mock LLM), which would otherwise make
+# a bare `cargo run` ambiguous.
+default-run = "genesis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# wasm runtime
+wasmtime = { version = "47", features = ["component-model", "cranelift"] }
+wasmtime-wasi = "47"
+
+# persistence
+redb = "4"
+
+# http server (gateway transport + /admin) and client (openrouter)
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["trace"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls-tls",
+] }
+futures-util = "0.3"
+bytes = "1"
+
+# build pipeline / hot reload
+notify = "8"
+notify-debouncer-full = "0.5"
+
+# misc
+uuid = { version = "1", features = ["v4", "serde"] }
+sha2 = "0.10"
+hex = "0.4"
+arc-swap = "1"
+dirs = "6"
+toml = "1.1.4"
+toml_edit = "0.25.13"
+
+[dev-dependencies]
+tempfile = "3.27.0"

@@ -1,0 +1,208 @@
+# Genesis configuration.
+#
+# Every setting below is optional — delete this file entirely and Genesis still
+# runs on its built-in defaults. Environment variables override anything here,
+# which is what makes per-run tweaks and secrets easy.
+#
+# A mistyped key is a startup error rather than a setting that quietly does
+# nothing, so if Genesis refuses to boot, read the message: it names the key.
+
+[server]
+bind = "127.0.0.1:7777"
+# Which gateway component serves the browser UI. The crate is expected at
+# <paths.gateways>/<paths.gateway_prefix><name>.
+primary_gateway = "web"
+# The host-rendered recovery console. Keep it on: it is the control surface
+# that still works when every WebAssembly guest is broken.
+admin_enabled = true
+
+[paths]
+# All relative paths are resolved against the project root (the directory
+# holding this file). Absolute paths are used as given.
+data = "data"
+artifacts = "artifacts"
+skills = "skills"
+templates = "templates"
+wit = "wit"
+agent = "agents/agent-core"
+gateways = "gateways"
+gateway_prefix = "gateway-"
+tools = "tools"
+tool_prefix = ""
+# A slot's directory name is also its cargo package name, which is how the
+# built component's filename is derived. Keep the two in step.
+
+[llm]
+base_url = "https://openrouter.ai/api/v1"
+model = "anthropic/claude-sonnet-4.5"
+request_timeout_secs = 180
+max_retries = 3
+# Your OpenRouter key. OPENROUTER_API_KEY overrides this when set, so you can
+# keep a key here for convenience and still override it per run.
+#
+# A real key in this file is a real key on disk: .gitignore already excludes
+# genesis.local.toml, so point GENESIS_CONFIG at one of those if this file is
+# ever going into version control.
+# api_key = "sk-or-..."
+
+[agent]
+# Tool-call rounds allowed in a single turn.
+max_iterations = 32
+default_mode = "agent"
+# The system prompt. Use `system_prompt_file` to keep it in its own file
+# (recommended once it grows), or `system_prompt` for a short inline one.
+# Leaving both empty uses the built-in prompt.
+# system_prompt_file = "prompts/system.md"
+
+# Models offered in the chat surface's picker. Providers change their
+# catalogues often, so this is the first thing worth editing.
+[[models]]
+id = "anthropic/claude-sonnet-4.5"
+label = "Claude Sonnet 4.5"
+
+[[models]]
+id = "anthropic/claude-opus-4.1"
+label = "Claude Opus 4.1"
+
+[[models]]
+id = "openai/gpt-4o"
+label = "GPT-4o"
+
+[[models]]
+id = "google/gemini-2.5-pro"
+label = "Gemini 2.5 Pro"
+
+# Ways of working, offered per conversation. `read_only` is carried through to
+# the agent, which withholds every tool that changes something — so adding a
+# mode here needs no agent code.
+[[modes]]
+id = "agent"
+label = "Agent"
+description = "Full access. Runs tools and can modify the running system."
+read_only = false
+
+[[modes]]
+id = "plan"
+label = "Plan"
+description = "Reads and reasons, but makes no changes. Tools that would modify anything are withheld."
+read_only = true
+
+[budgets]
+# Wall-clock ceiling for one whole turn.
+turn_secs = 300
+# Longest a guest may run without returning to a blocking host call. This is
+# what catches an infinite loop; it does not punish slow model calls, because
+# time parked in a host import does not count against it.
+wasm_slice_secs = 10
+tool_secs = 30
+probe_secs = 5
+
+[limits]
+agent_memory_mb = 512
+tool_memory_mb = 128
+gateway_memory_mb = 128
+# Per-conversation spend ceiling in USD. 0 disables the check.
+session_spend_limit_usd = 0.0
+# Tool and exec output is truncated to this before it reaches the model.
+max_tool_output_bytes = 32768
+max_attachment_bytes = 8388608
+max_attachments = 8
+
+# Prompt caching. Providers differ in kind, not just in syntax: Anthropic
+# caches nothing unless the request marks where, while OpenAI and Google cache
+# long prefixes on their own. Marking a moving prefix on a provider that already
+# caches would bill writes for nothing, so only the vendors listed here get
+# explicit breakpoints.
+[cache]
+enabled = true
+# "5m" or "1h". The longer one costs twice as much to write, and is worth it
+# only if gaps between turns regularly exceed five minutes.
+ttl = "5m"
+# Spacing of the stable anchor breakpoints in the message list. A cache read
+# looks back at most twenty blocks, so a turn that runs many tools can overshoot
+# the previous mark; the anchors hold still and stay within reach. Smaller means
+# more resilience and more writes.
+anchor_stride = 8
+explicit_vendors = ["anthropic"]
+
+[build]
+command = "cargo"
+target = "wasm32-wasip2"
+profile = "release"
+# Shared cargo target directory, so guests compile their dependencies once.
+target_dir = "target-wasm"
+# Pass --locked when a lockfile exists, keeping dependency resolution
+# reproducible for builds the agent triggers.
+locked = true
+extra_args = []
+
+[watchdog]
+# Failures inside this window count toward the same circuit breaker.
+failure_window_secs = 120
+# Failures before a slot is rolled back to its last known-good revision.
+failure_threshold = 3
+probe_interval_secs = 30
+# How long the file watcher ignores a slot the orchestrator just wrote to, so a
+# rollback is not immediately rebuilt over.
+watch_suppression_secs = 5
+# Editors save in bursts; wait for the dust to settle before spending a compile.
+debounce_ms = 500
+
+[devkit]
+# Whether the agent is offered the tools that modify the running system.
+enabled = true
+# Files that decide what runs during a build. A host-side build executes them,
+# so guests may not edit them — changing dependencies stays a human decision.
+protected_files = ["Cargo.toml", "Cargo.lock", "build.rs"]
+protected_dirs = [".cargo", "target"]
+
+[sandbox]
+# The Docker exec sandbox. While off, the agent is simply not offered
+# code-execution tools rather than being handed tools that always fail.
+enabled = false
+
+# Reading and writing files on this machine. Unlike [sandbox], these touch the
+# host directly, so the roots below are the real boundary: every path the agent
+# gives is resolved — symlinks included — and must land inside one of them.
+[filesystem]
+enabled = true
+# Empty means the project root. Add more to widen what the agent can reach.
+roots = []
+max_read_bytes = 1048576
+# Names that may not be written or deleted anywhere under a root. This keeps the
+# system from destroying its own state by accident; it is not a security
+# control, since a terminal session can reach these paths regardless.
+protected = ["data", "artifacts", ".git"]
+allow_delete = true
+
+# Shell sessions on this machine. A session keeps its working directory and
+# shell state between commands.
+[terminal]
+enabled = true
+# Empty picks PowerShell on Windows and sh elsewhere.
+shell = ""
+shell_args = []
+max_sessions = 4
+default_timeout_ms = 30000
+max_output_bytes = 65536
+# Sessions idle longer than this are closed. 0 disables reaping.
+idle_timeout_secs = 1800
+
+# Per-tool settings. Each tool component is handed its own block as JSON when it
+# is invoked, and never sees another's or anything else here. The shape is
+# whatever that tool expects — put its API keys, endpoints and defaults here
+# rather than hardcoding them in its source.
+[tools.config-probe]
+greeting = "hello from configuration"
+retries = 3
+
+[control]
+# Whether the agent may restart the orchestrator. A restart is how changes to
+# the native binary, or to settings only read at startup, take effect.
+allow_restart = true
+# Restarts are refused before this much uptime, so a restart that fails to fix
+# anything cannot become a loop.
+min_uptime_secs = 20
+# Delay before the process replaces itself, so the turn finishes and the user
+# reads why first.
+restart_delay_ms = 1500
