@@ -6,7 +6,8 @@
 //! caught by the gates and the running system is untouched.
 
 use anyhow::{Context, Result};
-use notify::RecursiveMode;
+use notify::event::ModifyKind;
+use notify::{EventKind, RecursiveMode};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, RecommendedCache};
 use std::collections::HashSet;
 use std::path::Path;
@@ -32,6 +33,9 @@ pub fn spawn(harness: Arc<Harness>) -> Result<WatchHandle> {
         let Ok(events) = result else { return };
         let mut slots = HashSet::new();
         for event in events {
+            if !is_source_change(&event.kind) {
+                continue;
+            }
             for path in &event.paths {
                 slots.extend(slots_for_path(&cfg, path));
             }
@@ -95,6 +99,27 @@ async fn rebuild(harness: &Arc<Harness>, slot: &Slot) {
             }
         }
         Err(e) => tracing::error!(%slot, error = %e, "rebuild pipeline failed"),
+    }
+}
+
+/// Whether an event actually changed source, as opposed to merely touching it.
+///
+/// This is load-bearing. Linux reports reads: cargo opening `Cargo.toml` and
+/// every `.rs` file during a build emits `Access(Open)` for each one. Treating
+/// those as source changes makes a build its own trigger, and the watcher spins
+/// rebuilding forever at whatever rate the debounce allows. Windows has no
+/// file-open notification at all, so the loop never appears there.
+///
+/// Timestamp-only changes are excluded for the same reason: restoring a
+/// revision touches files so cargo notices them, and that must not read back as
+/// a fresh edit.
+fn is_source_change(kind: &EventKind) -> bool {
+    match kind {
+        EventKind::Access(_) => false,
+        EventKind::Modify(ModifyKind::Metadata(_)) => false,
+        EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(_) => true,
+        // Platforms that cannot classify an event report `Any`; assume it counted.
+        EventKind::Any | EventKind::Other => true,
     }
 }
 
@@ -204,6 +229,26 @@ mod tests {
             slots_for_path(&cfg, Path::new("C:/proj/tools/weather/src/lib.rs")),
             vec![Slot::tool("weather")]
         );
+    }
+
+    #[test]
+    fn ignores_reads_so_a_build_cannot_retrigger_itself() {
+        use notify::event::{AccessKind, AccessMode, CreateKind, DataChange, MetadataKind,
+                            RemoveKind};
+
+        // What cargo generates just by reading the sources it compiles.
+        assert!(!is_source_change(&EventKind::Access(AccessKind::Open(AccessMode::Any))));
+        assert!(!is_source_change(&EventKind::Access(AccessKind::Read)));
+        // A restore touches files; that is not an edit.
+        assert!(!is_source_change(&EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::WriteTime
+        ))));
+
+        // Real edits still rebuild.
+        assert!(is_source_change(&EventKind::Modify(ModifyKind::Data(DataChange::Any))));
+        assert!(is_source_change(&EventKind::Create(CreateKind::File)));
+        assert!(is_source_change(&EventKind::Remove(RemoveKind::File)));
+        assert!(is_source_change(&EventKind::Any));
     }
 
     #[test]
