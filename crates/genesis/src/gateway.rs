@@ -128,8 +128,9 @@ impl Renderer {
 
         let warm = self.warm.as_mut()?;
         warm.calls += 1;
-        // The store outlives a single call, so its budget must be rearmed or the
-        // wall-clock ceiling would expire mid-session.
+        // The store outlives a single call, so its budget must be rearmed: the
+        // last-yield mark keeps ageing between events, and would eventually
+        // read as a guest that had stopped talking to the host.
         warm.store.data_mut().budget = Budget::probe(
             "gateway render-event",
             self.harness.cfg.probe_budget,
