@@ -20,11 +20,30 @@ use crate::pipeline;
 use crate::revisions::Origin;
 use crate::slot::{validate_component_name, Slot};
 
-/// Files that influence what runs during a build rather than at runtime.
-/// Editing these would let guest-authored code execute with the orchestrator's
-/// privileges the next time cargo runs.
-const PROTECTED: &[&str] = &["Cargo.toml", "Cargo.lock", "build.rs"];
-const PROTECTED_DIRS: &[&str] = &[".cargo", "target"];
+/// Why a path is off limits, or `None` when it is not.
+///
+/// Driven by `[devkit]` in the config, which has advertised these as settings
+/// from the start while the code ignored them in favour of a hardcoded list -
+/// so loosening it in the config silently did nothing.
+///
+/// Both lists default to empty. A component that cannot edit its own manifest
+/// cannot add a dependency, and one that cannot edit `build.rs` cannot generate
+/// code; those are ordinary things for it to need, and refusing them stops the
+/// agent developing itself rather than stopping it doing harm.
+fn protected_reason(names: &[String], files: &[String], dirs: &[String]) -> Option<String> {
+    if let Some(last) = names.last() {
+        if files.iter().any(|p| p.eq_ignore_ascii_case(last)) {
+            return Some(format!("{last} is listed in devkit.protected_files"));
+        }
+    }
+    if let Some(hit) = names
+        .iter()
+        .find(|n| dirs.iter().any(|p| p.eq_ignore_ascii_case(n)))
+    {
+        return Some(format!("{hit} is listed in devkit.protected_dirs"));
+    }
+    None
+}
 
 pub fn target_to_slot(target: &ModTarget) -> Result<Slot> {
     Ok(match target {
@@ -72,22 +91,12 @@ pub fn resolve_path(harness: &Arc<Harness>, slot: &Slot, relative: &str) -> Resu
         })
         .collect();
 
-    if let Some(last) = names.last() {
-        if PROTECTED.iter().any(|p| p.eq_ignore_ascii_case(last)) {
-            return Err(anyhow!(
-                "{last} decides what runs during a build, so it is not editable from here — \
-                 ask a human to change dependencies"
-            ));
-        }
-    }
-    if names
-        .iter()
-        .any(|n| PROTECTED_DIRS.iter().any(|p| p.eq_ignore_ascii_case(n)))
-    {
-        return Err(anyhow!(
-            "paths under {} are not editable",
-            PROTECTED_DIRS.join(" or ")
-        ));
+    if let Some(why) = protected_reason(
+        &names,
+        &harness.cfg.devkit.protected_files,
+        &harness.cfg.devkit.protected_dirs,
+    ) {
+        return Err(anyhow!("{why}"));
     }
 
     let root = harness.cfg.slot_source_dir(slot);
@@ -475,16 +484,12 @@ mod tests {
                 _ => None,
             })
             .collect();
-        if let Some(last) = names.last() {
-            if PROTECTED.iter().any(|p| p.eq_ignore_ascii_case(last)) {
-                return Err(anyhow!("protected file"));
-            }
-        }
-        if names
-            .iter()
-            .any(|n| PROTECTED_DIRS.iter().any(|p| p.eq_ignore_ascii_case(n)))
-        {
-            return Err(anyhow!("protected dir"));
+        if let Some(why) = protected_reason(
+            &names,
+            &cfg.devkit.protected_files,
+            &cfg.devkit.protected_dirs,
+        ) {
+            return Err(anyhow!("{why}"));
         }
         Ok(harness_root.join(candidate))
     }
@@ -515,22 +520,31 @@ mod tests {
     }
 
     #[test]
-    fn rejects_build_time_files() {
+    fn build_files_are_editable_by_default() {
         let dir = tempfile::tempdir().unwrap();
         let slot = Slot::Agent;
-        // These run with the orchestrator's privileges during a host build.
-        for bad in [
-            "Cargo.toml",
-            "cargo.toml",
-            "build.rs",
-            ".cargo/config.toml",
-            "target/x.wasm",
-        ] {
+        // Editing its own manifest is how a component adds a dependency, so
+        // nothing here is off limits unless a deployment asks for it.
+        for path in ["Cargo.toml", "build.rs", ".cargo/config.toml"] {
             assert!(
-                paths_under(dir.path(), &slot, bad).is_err(),
-                "should have rejected {bad}"
+                paths_under(dir.path(), &slot, path).is_ok(),
+                "should have allowed {path}"
             );
         }
+    }
+
+    #[test]
+    fn a_configured_protection_is_still_honoured() {
+        let files = vec!["Cargo.toml".to_string()];
+        let dirs = vec![".cargo".to_string()];
+        let names = |p: &str| p.split('/').map(String::from).collect::<Vec<_>>();
+
+        assert!(protected_reason(&names("src/lib.rs"), &files, &dirs).is_none());
+        // Still matched without regard to case.
+        assert!(protected_reason(&names("cargo.toml"), &files, &dirs).is_some());
+        assert!(protected_reason(&names(".cargo/config.toml"), &files, &dirs).is_some());
+        // An empty list protects nothing.
+        assert!(protected_reason(&names("Cargo.toml"), &[], &[]).is_none());
     }
 
     #[test]

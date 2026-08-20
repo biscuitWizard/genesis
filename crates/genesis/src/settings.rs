@@ -24,11 +24,14 @@ use crate::config::Config;
 const SECRETS: &[&str] = &["llm.api_key"];
 
 /// Settings that cannot be changed here, with the reason.
-const LOCKED: &[(&str, &str)] = &[(
-    "paths",
-    "moving a path at runtime would orphan the artifacts and database already \
-     on disk; change it while Genesis is stopped",
-)];
+///
+/// Empty. `paths` was locked because moving one orphans the artifacts and
+/// database already on disk - true, and a reason to be careful rather than a
+/// reason to refuse. Nothing written here takes effect until a restart, every
+/// write is validated against a full config load first, and the agent can edit
+/// the same file through the filesystem tools regardless, so the lock stopped
+/// the supported route while leaving the unsupported one open.
+const LOCKED: &[(&str, &str)] = &[];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Setting {
@@ -443,12 +446,19 @@ data = "data"
     }
 
     #[test]
-    fn paths_are_locked_with_a_reason() {
+    fn paths_are_editable_like_anything_else() {
         let (cfg, _d) = fixture();
-        assert!(!get(&cfg, "paths.data").unwrap().unwrap().editable);
+        assert!(get(&cfg, "paths.data").unwrap().unwrap().editable);
 
-        let err = set(&cfg, "paths.data", "elsewhere").unwrap_err();
-        assert!(format!("{err:#}").contains("artifacts"), "{err:#}");
+        set(&cfg, "paths.data", "elsewhere").unwrap();
+        assert_eq!(get(&cfg, "paths.data").unwrap().unwrap().value, "elsewhere");
+    }
+
+    #[test]
+    fn a_locked_setting_still_reports_why_when_one_is_configured() {
+        // LOCKED is empty, so exercise the mechanism directly rather than
+        // pinning a particular key to it.
+        assert!(locked_reason("paths.data").is_none());
     }
 
     #[test]

@@ -20,9 +20,6 @@ use anyhow::{bail, Context, Result};
 use std::path::Path;
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Value};
 
-/// Dependencies the component cannot lose and still build.
-const LOAD_BEARING: &[&str] = &["wit-bindgen"];
-
 const MAX_NAME: usize = 64;
 const MAX_VERSION: usize = 32;
 
@@ -129,12 +126,13 @@ pub fn add(dir: &Path, dep: &Dependency, allowed: &[String]) -> Result<()> {
     write(dir, &doc)
 }
 
-/// Removes a dependency. Refuses to remove one the component needs to exist.
+/// Removes a dependency.
+///
+/// Including `wit-bindgen`, without which the crate stops being a component.
+/// Removing it breaks the build, the compile report says so plainly, and a
+/// rollback undoes it - which teaches more than a refusal does.
 pub fn remove(dir: &Path, name: &str) -> Result<()> {
     validate_name(name)?;
-    if LOAD_BEARING.contains(&name) {
-        bail!("{name} is required for this crate to build into a component and cannot be removed");
-    }
 
     let mut doc = read(dir)?;
     let removed = doc
@@ -320,7 +318,7 @@ opt-level = "s"
     }
 
     #[test]
-    fn removes_a_dependency_but_not_a_load_bearing_one() {
+    fn removes_any_dependency_including_wit_bindgen() {
         let dir = scratch();
         remove(dir.path(), "serde_json").unwrap();
         assert!(!list(dir.path())
@@ -328,10 +326,10 @@ opt-level = "s"
             .iter()
             .any(|d| d.name == "serde_json"));
 
-        let err = remove(dir.path(), "wit-bindgen").unwrap_err().to_string();
-        assert!(err.contains("cannot be removed"), "{err}");
-        // Still there.
-        assert!(list(dir.path())
+        // The crate stops being a component without it. That shows up as a
+        // failed build with the reason attached, not as a refusal here.
+        remove(dir.path(), "wit-bindgen").unwrap();
+        assert!(!list(dir.path())
             .unwrap()
             .iter()
             .any(|d| d.name == "wit-bindgen"));

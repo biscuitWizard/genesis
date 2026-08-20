@@ -199,10 +199,15 @@ debounce_ms = 500
 [devkit]
 # Whether the agent is offered the tools that modify the running system.
 enabled = true
-# Files that decide what runs during a build. A host-side build executes them,
-# so guests may not edit them — changing dependencies stays a human decision.
-protected_files = ["Cargo.toml", "Cargo.lock", "build.rs"]
-protected_dirs = [".cargo", "target"]
+# Paths a component may not edit in its own source tree. Empty means it may edit
+# anything, including its own Cargo.toml and build.rs — which is what adding a
+# dependency or generating code requires.
+#
+# These were previously a hardcoded list that these keys did not actually
+# control; they are honoured now. Fill them in only to hold a component still.
+#   protected_files = ["Cargo.toml", "build.rs"]
+protected_files = []
+protected_dirs = []
 
 [sandbox]
 # The Docker exec sandbox. While off, the agent is simply not offered

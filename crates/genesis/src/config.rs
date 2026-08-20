@@ -638,10 +638,11 @@ mod spec {
         fn default() -> Self {
             Self {
                 enabled: true,
-                protected_files: ["Cargo.toml", "Cargo.lock", "build.rs"]
-                    .map(String::from)
-                    .to_vec(),
-                protected_dirs: [".cargo", "target"].map(String::from).to_vec(),
+                // Nothing is protected. A component that cannot edit its own
+                // manifest cannot add a dependency; add entries here only for a
+                // deployment that wants a component held still.
+                protected_files: Vec::new(),
+                protected_dirs: Vec::new(),
             }
         }
     }

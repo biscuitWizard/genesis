@@ -298,11 +298,12 @@ impl session::Host for HostState {
     }
 
     async fn set_session_model(&mut self, session_id: String, model: String) -> Result<()> {
-        let known = model.is_empty()
-            || self.harness().cfg.models.iter().any(|m| m.id == model);
-        if !known {
-            return Err(err(format!("unknown model: {model}")));
-        }
+        // Any model id is accepted. The configured list is what the picker
+        // offers, not what the provider supports, so checking against it meant a
+        // model had to be added to the config - and the process restarted -
+        // before it could ever be tried. A wrong id comes back from the provider
+        // as a clear error on the next turn, which is a better place to find out
+        // than a rejected click.
         self.harness().db.set_model(&session_id, &model).wt()?;
         Ok(())
     }
