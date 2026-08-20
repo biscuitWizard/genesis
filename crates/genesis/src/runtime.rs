@@ -46,29 +46,33 @@ pub struct Budget {
     /// Refreshed whenever a potentially-blocking host import returns, so time
     /// spent waiting on the network is not charged as guest CPU.
     pub last_yield: Instant,
-    /// Wall-clock ceiling for the whole call.
-    pub total: Duration,
     /// Longest the guest may run without returning to a blocking host import.
-    /// Catches infinite loops long before the wall-clock budget expires.
+    ///
+    /// This is the only time limit. There is deliberately no wall-clock ceiling
+    /// on a call: a turn that streams a long answer, runs a dozen tools and
+    /// compiles something is doing exactly what it should, and killing it at an
+    /// arbitrary number of seconds destroys real work while catching nothing a
+    /// runaway would not also trip here. What actually distinguishes a wedged
+    /// guest is that it stops talking to the host, which is what this measures.
     pub slice: Duration,
     pub cancelled: bool,
 }
 
 impl Budget {
-    pub fn new(label: impl Into<String>, total: Duration, slice: Duration) -> Self {
+    pub fn new(label: impl Into<String>, slice: Duration) -> Self {
         let now = Instant::now();
         Self {
             label: label.into(),
             started: now,
             last_yield: now,
-            total,
             slice,
             cancelled: false,
         }
     }
 
-    pub fn probe(label: impl Into<String>, total: Duration) -> Self {
-        Self::new(label, total, total)
+    /// A short call that is not expected to yield at all, such as `health()`.
+    pub fn probe(label: impl Into<String>, limit: Duration) -> Self {
+        Self::new(label, limit)
     }
 
     /// Records that the guest just came back from a blocking host call.
@@ -79,13 +83,6 @@ impl Budget {
     fn violation(&self) -> Option<String> {
         if self.cancelled {
             return Some(format!("{}: cancelled by orchestrator", self.label));
-        }
-        let elapsed = self.started.elapsed();
-        if elapsed > self.total {
-            return Some(format!(
-                "{}: exceeded wall-clock budget of {:?} (ran {:?})",
-                self.label, self.total, elapsed
-            ));
         }
         let spinning = self.last_yield.elapsed();
         if spinning > self.slice {
@@ -329,22 +326,28 @@ mod tests {
 
     #[test]
     fn budget_allows_work_within_limits() {
-        let b = Budget::new("turn", Duration::from_secs(60), Duration::from_secs(10));
+        let b = Budget::new("turn", Duration::from_secs(10));
         assert!(b.violation().is_none());
     }
 
     #[test]
-    fn budget_trips_on_wall_clock() {
-        let mut b = Budget::new("turn", Duration::from_millis(1), Duration::from_secs(60));
-        std::thread::sleep(Duration::from_millis(5));
-        b.yielded(); // even after yielding, the total budget still applies
-        let v = b.violation().expect("should trip");
-        assert!(v.contains("wall-clock"), "{v}");
+    fn a_long_call_is_fine_as_long_as_it_keeps_talking_to_the_host() {
+        // What used to trip the wall clock: a turn that runs far longer than
+        // any fixed ceiling, yielding at each host call the way a streaming
+        // completion or a tool dispatch does.
+        let mut b = Budget::new("turn", Duration::from_millis(20));
+        for _ in 0..10 {
+            std::thread::sleep(Duration::from_millis(10));
+            b.yielded();
+            assert!(b.violation().is_none());
+        }
+        // Well past what a 50ms wall-clock budget would have allowed.
+        assert!(b.started.elapsed() > Duration::from_millis(50));
     }
 
     #[test]
     fn budget_trips_on_spin_without_yielding() {
-        let b = Budget::new("turn", Duration::from_secs(60), Duration::from_millis(1));
+        let b = Budget::new("turn", Duration::from_millis(1));
         std::thread::sleep(Duration::from_millis(5));
         let v = b.violation().expect("should trip");
         assert!(v.contains("infinite loop"), "{v}");
@@ -352,7 +355,7 @@ mod tests {
 
     #[test]
     fn yielding_resets_the_spin_timer() {
-        let mut b = Budget::new("turn", Duration::from_secs(60), Duration::from_millis(20));
+        let mut b = Budget::new("turn", Duration::from_millis(20));
         std::thread::sleep(Duration::from_millis(15));
         b.yielded();
         std::thread::sleep(Duration::from_millis(15));
@@ -362,7 +365,7 @@ mod tests {
 
     #[test]
     fn cancellation_is_a_violation() {
-        let mut b = Budget::new("turn", Duration::from_secs(60), Duration::from_secs(60));
+        let mut b = Budget::new("turn", Duration::from_secs(60));
         b.cancelled = true;
         assert!(b.violation().unwrap().contains("cancelled"));
     }

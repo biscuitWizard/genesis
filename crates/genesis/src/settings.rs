@@ -473,8 +473,8 @@ data = "data"
     #[test]
     fn a_setting_the_file_omits_can_still_be_added() {
         let (cfg, _d) = fixture();
-        set(&cfg, "budgets.turn_secs", "600").unwrap();
+        set(&cfg, "budgets.tool_secs", "600").unwrap();
 
-        assert_eq!(value_of(&cfg, "budgets.turn_secs"), "600");
+        assert_eq!(value_of(&cfg, "budgets.tool_secs"), "600");
     }
 }

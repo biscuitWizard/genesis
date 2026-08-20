@@ -109,11 +109,13 @@ say so plainly and stop; the user will switch to Agent mode to carry it out.
 """
 
 [budgets]
-# Wall-clock ceiling for one whole turn.
-turn_secs = 300
 # Longest a guest may run without returning to a blocking host call. This is
 # what catches an infinite loop; it does not punish slow model calls, because
 # time parked in a host import does not count against it.
+#
+# There is deliberately no ceiling on how long a whole turn may take. A turn
+# that streams a long answer, runs a dozen tools and compiles something is doing
+# its job, and a fixed number of seconds cannot tell that apart from a hang.
 wasm_slice_secs = 10
 tool_secs = 30
 probe_secs = 5
@@ -167,8 +169,8 @@ allowed_crates = []
 
 [wasi]
 # Guests run on WASI preview 2, which grants nothing until it is told to. These
-# are the grants. They apply to every guest; the component boundary, the memory
-# ceiling and the turn budget are what actually contain a tool.
+# are the grants. They apply to every guest; the component boundary and the
+# memory ceiling are what actually contain a tool.
 #
 # Outbound sockets and wasi:http. A tool that talks to a web API needs both of
 # these; TLS is terminated host-side, because no TLS crate builds for

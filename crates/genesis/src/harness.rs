@@ -186,11 +186,7 @@ impl Harness {
             TurnError::Reported("no agent component is loaded".to_string())
         })?;
 
-        let budget = Budget::new(
-            format!("agent turn ({session_id})"),
-            self.cfg.turn_budget,
-            self.cfg.wasm_slice,
-        );
+        let budget = Budget::new(format!("agent turn ({session_id})"), self.cfg.wasm_slice);
         let mut store = self.runtime.new_store(
             self.clone(),
             Caps::Agent,
@@ -414,11 +410,7 @@ impl Harness {
         // another's.
         let config_json = self.cfg.tool_config_json(name);
 
-        let budget = Budget::new(
-            format!("tool {name}"),
-            self.cfg.tool_budget,
-            self.cfg.tool_budget,
-        );
+        let budget = Budget::new(format!("tool {name}"), self.cfg.tool_budget);
         let mut store = self.runtime.new_store(
             self.clone(),
             Caps::Tool,

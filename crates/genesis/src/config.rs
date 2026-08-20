@@ -248,7 +248,6 @@ pub struct Config {
     pub default_mode: String,
 
     // --- budgets -----------------------------------------------------------
-    pub turn_budget: Duration,
     pub wasm_slice: Duration,
     pub tool_budget: Duration,
     pub probe_budget: Duration,
@@ -489,7 +488,6 @@ mod spec {
     #[derive(Debug, Deserialize)]
     #[serde(default, deny_unknown_fields)]
     pub struct Budgets {
-        pub turn_secs: u64,
         pub wasm_slice_secs: u64,
         pub tool_secs: u64,
         pub probe_secs: u64,
@@ -497,7 +495,6 @@ mod spec {
     impl Default for Budgets {
         fn default() -> Self {
             Self {
-                turn_secs: 300,
                 wasm_slice_secs: 10,
                 tool_secs: 30,
                 probe_secs: 5,
@@ -937,10 +934,6 @@ impl Config {
             modes,
             default_mode,
 
-            turn_budget: Duration::from_secs(env_parse(
-                "GENESIS_TURN_BUDGET_SECS",
-                file.budgets.turn_secs,
-            )),
             wasm_slice: Duration::from_secs(env_parse(
                 "GENESIS_WASM_SLICE_SECS",
                 file.budgets.wasm_slice_secs,
