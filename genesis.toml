@@ -108,6 +108,31 @@ have done with it instead of quietly working around it. When the plan is ready, 
 say so plainly and stop; the user will switch to Agent mode to carry it out.
 """
 
+# Summarizing a long conversation down, so it can keep going past the window.
+#
+# The trigger is the provider's own usage.prompt_tokens from the last turn - the
+# entire input it saw, system prompt and tool schemas included - so it measures
+# what actually costs money rather than estimating one part of it.
+[context]
+enabled = true
+# Assumed usable window. Deliberately under any real one: compaction should
+# happen well before the provider starts refusing, not at the cliff edge.
+window_tokens = 200000
+# Compact when the context passes this fraction of the window...
+compact_threshold = 0.6
+# ...and shed until it is back under this one. Summarizing stops at the first
+# round boundary that gets under the target, so a long conversation sheds what
+# it must and keeps the rest.
+compact_target = 0.25
+# A cheaper model for the summaries themselves. Empty uses the session's model.
+# summary_model = "anthropic/claude-haiku-4.5"
+summary_model = ""
+# Never summarized: the opening messages, which everything after them refers
+# back to, and the most recent ones, which are the agent's working memory. User
+# messages are never summarized either, wherever they sit.
+keep_head = 4
+keep_tail = 30
+
 [budgets]
 # Longest a guest may run without returning to a blocking host call. This is
 # what catches an infinite loop; it does not punish slow model calls, because

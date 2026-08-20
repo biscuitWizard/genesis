@@ -52,27 +52,6 @@ impl HostState {
         &self.harness
     }
 
-    /// Blanks a session's model override when that model is no longer offered.
-    ///
-    /// A conversation pinned to a model that has since been removed from the
-    /// catalogue would otherwise keep sending an id the provider rejects. The
-    /// stored value is left alone; reporting it as unset means both the agent
-    /// and the chat surface see what will actually be used.
-    fn drop_unavailable_model(&self, meta: &mut SessionMeta) {
-        if meta.model.is_empty() {
-            return;
-        }
-        let offered = self.harness.cfg.models.iter().any(|m| m.id == meta.model);
-        if !offered {
-            tracing::debug!(
-                session = %meta.id,
-                model = %meta.model,
-                "session pinned to a model that is no longer configured; using the default"
-            );
-            meta.model.clear();
-        }
-    }
-
     /// Notes that this call changed a component, so the caller can tell the
     /// model when the change takes effect.
     fn note_pending_swap(&mut self, target: &ModTarget) {
@@ -134,6 +113,19 @@ impl sys::Host for HostState {
             // The dev kit is wired up; the agent uses this to decide whether to
             // offer itself the self-modification tools.
             "devkit_available" => Some(cfg.devkit.enabled.to_string()),
+            // Context compaction. The agent owns the decision of what to shed,
+            // so it needs the thresholds rather than being told when to act.
+            "compact_enabled" => Some(cfg.context.enabled.to_string()),
+            "context_window" => Some(cfg.context.window.to_string()),
+            "compact_threshold" => Some(cfg.context.compact_threshold.to_string()),
+            "compact_target" => Some(cfg.context.compact_target.to_string()),
+            "summary_model" => Some(if cfg.context.summary_model.is_empty() {
+                cfg.model.clone()
+            } else {
+                cfg.context.summary_model.clone()
+            }),
+            "keep_head" => Some(cfg.context.keep_head.to_string()),
+            "keep_tail" => Some(cfg.context.keep_tail.to_string()),
             _ => None,
         })
     }
@@ -200,19 +192,15 @@ impl session::Host for HostState {
     }
 
     async fn list_sessions(&mut self, include_archived: bool) -> Result<Vec<SessionMeta>> {
-        let mut sessions = self.harness().db.list_sessions(include_archived).wt()?;
-        for meta in &mut sessions {
-            self.drop_unavailable_model(meta);
-        }
-        Ok(sessions)
+        // Whatever model a session names is reported as-is. The catalogue is
+        // what the picker offers, not the set of ids the provider accepts, so
+        // silently swapping an unlisted one for the default made a deliberate
+        // choice look like it had been ignored.
+        self.harness().db.list_sessions(include_archived).wt()
     }
 
     async fn get_session(&mut self, session_id: String) -> Result<Option<SessionMeta>> {
-        let mut meta = self.harness().db.get_session(&session_id).wt()?;
-        if let Some(meta) = meta.as_mut() {
-            self.drop_unavailable_model(meta);
-        }
-        Ok(meta)
+        self.harness().db.get_session(&session_id).wt()
     }
 
     async fn create_session(&mut self, title: Option<String>) -> Result<String> {

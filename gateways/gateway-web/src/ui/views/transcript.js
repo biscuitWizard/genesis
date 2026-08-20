@@ -217,6 +217,29 @@ const RENDERERS = {
 
   "tool-result": completeToolRow,
 
+  compacted(ev) {
+    live = null;
+    // Foldable rather than a bare line: the summary is what the model now sees
+    // in place of those messages, so it should be readable on demand.
+    const node = el(
+      "details",
+      { class: "tool" },
+      el(
+        "summary",
+        {},
+        el("span", { class: "tool-name" }, "context compacted"),
+        el(
+          "span",
+          { class: "tool-args" },
+          `${ev.replaced} earlier messages summarized · was ~${(ev.tokens_before ?? 0).toLocaleString()} tokens`
+        ),
+        el("span", { class: "tool-status" }, "summary")
+      ),
+      ...section("summary", ev.summary)
+    );
+    root.append(node);
+  },
+
   nudge: (ev) => meta(`you interrupted: ${ev.text}`, "is-nudge"),
   note: (ev) => meta(ev.text),
 

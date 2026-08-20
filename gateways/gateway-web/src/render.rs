@@ -78,6 +78,15 @@ pub fn event(ev: &OutboundEvent) -> Option<Value> {
             "tools": stats.tools_used,
             "stopped_by": stats.stopped_by,
         }),
+
+        // Worth showing: the reader should be able to see that older messages
+        // are now standing in summarized form, and roughly how much went.
+        SessionEvent::ContextCompacted(c) => json!({
+            "kind": "compacted",
+            "replaced": c.messages_replaced,
+            "tokens_before": c.tokens_before,
+            "summary": c.summary,
+        }),
     };
 
     let obj = body.as_object_mut()?;

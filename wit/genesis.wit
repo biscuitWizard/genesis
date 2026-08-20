@@ -78,6 +78,27 @@ interface types {
 
   // One entry in a session's append-only log. `stream-delta` is the sole
   // transient case: it is rendered to clients but never persisted.
+  /// A stretch of the event log, by sequence number, inclusive at both ends.
+  record seq-span {
+    from-seq: u64,
+    through-seq: u64,
+  }
+
+  /// A summary standing in for stretches of the log when the conversation is
+  /// rebuilt for the model.
+  ///
+  /// The events themselves are never removed - the log stays append-only, and
+  /// compaction only changes how it is projected into messages. That is what
+  /// makes the originals recoverable without a separate offload store.
+  record compaction {
+    /// What this summary replaces. Several spans, because preserved user
+    /// messages break the summarized region into pieces.
+    spans: list<seq-span>,
+    summary: string,
+    messages-replaced: u32,
+    tokens-before: u32,
+  }
+
   variant session-event {
     user-message(user-msg),
     assistant-message(assistant-msg),
@@ -90,6 +111,7 @@ interface types {
     turn-started,
     turn-finished(turn-stats),
     stream-delta(string),
+    context-compacted(compaction),
   }
 
   record event-record {

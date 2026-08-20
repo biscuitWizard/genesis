@@ -155,6 +155,30 @@ pub enum CacheStrategy {
     Breakpoints,
 }
 
+/// When and how a long conversation is summarized down.
+///
+/// The trigger reads the provider's own `usage.prompt_tokens` from the last
+/// turn, which is the whole input it saw - system prompt, tool schemas and all
+/// history - so it measures the thing that actually costs money, not an
+/// estimate of one part of it.
+#[derive(Debug, Clone)]
+pub struct ContextSettings {
+    pub enabled: bool,
+    /// Assumed usable context window, in tokens.
+    pub window: u32,
+    /// Fraction of the window that triggers compaction.
+    pub compact_threshold: f64,
+    /// Fraction of the window to compact back down to. Compaction stops at the
+    /// first round boundary under this, so it sheds what is needed and no more.
+    pub compact_target: f64,
+    /// A cheaper model for the summary itself. Empty uses the session's model.
+    pub summary_model: String,
+    /// Messages at the start of the conversation kept verbatim.
+    pub keep_head: u32,
+    /// Messages at the end kept verbatim - the agent's live working memory.
+    pub keep_tail: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct CacheSettings {
     pub enabled: bool,
@@ -261,6 +285,7 @@ pub struct Config {
     pub max_attachment_bytes: usize,
     pub max_attachments: usize,
 
+    pub context: ContextSettings,
     pub cache: CacheSettings,
     pub build: BuildSettings,
     pub wasi: WasiSettings,
@@ -359,6 +384,7 @@ mod spec {
         pub modes: Vec<Mode>,
         pub budgets: Budgets,
         pub limits: Limits,
+        pub context: Context,
         pub cache: Cache,
         pub build: Build,
         pub watchdog: Watchdog,
@@ -523,6 +549,34 @@ mod spec {
                 max_tool_output_bytes: 32_768,
                 max_attachment_bytes: 8_388_608,
                 max_attachments: 8,
+            }
+        }
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(default, deny_unknown_fields)]
+    pub struct Context {
+        pub enabled: bool,
+        pub window_tokens: u32,
+        pub compact_threshold: f64,
+        pub compact_target: f64,
+        pub summary_model: String,
+        pub keep_head: u32,
+        pub keep_tail: u32,
+    }
+    impl Default for Context {
+        fn default() -> Self {
+            Self {
+                enabled: true,
+                // Deliberately below any real window: the point is to compact
+                // well before the provider starts refusing, not at the cliff.
+                window_tokens: 200_000,
+                compact_threshold: 0.6,
+                compact_target: 0.25,
+                // Empty means "whatever the session is using".
+                summary_model: String::new(),
+                keep_head: 4,
+                keep_tail: 30,
             }
         }
     }
@@ -967,6 +1021,17 @@ impl Config {
                 file.limits.max_attachment_bytes,
             ),
             max_attachments: env_parse("GENESIS_MAX_ATTACHMENTS", file.limits.max_attachments),
+
+            context: ContextSettings {
+                enabled: env_parse("GENESIS_COMPACT", file.context.enabled),
+                window: env_parse("GENESIS_CONTEXT_WINDOW", file.context.window_tokens).max(1),
+                compact_threshold: file.context.compact_threshold.clamp(0.05, 0.99),
+                compact_target: file.context.compact_target.clamp(0.01, 0.95),
+                summary_model: env_string("GENESIS_SUMMARY_MODEL")
+                    .unwrap_or(file.context.summary_model),
+                keep_head: file.context.keep_head,
+                keep_tail: file.context.keep_tail,
+            },
 
             cache: CacheSettings {
                 enabled: env_parse("GENESIS_CACHE", file.cache.enabled),

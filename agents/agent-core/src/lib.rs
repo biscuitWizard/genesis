@@ -25,6 +25,7 @@ use genesis::harness::types::{
 // `tool-manifest` comes in via the world's own `use types.{...}`.
 use serde_json::{json, Value};
 
+mod compaction;
 mod tools;
 
 struct Component;
@@ -80,6 +81,14 @@ struct Turn {
     max_iterations: u32,
     /// The conversation as the model sees it.
     messages: Vec<Value>,
+    /// The log sequence each message came from, in step with `messages`, so a
+    /// compaction can be recorded against the log rather than against this
+    /// particular rebuilding of it. The system prompt has no source, and takes 0.
+    origins: Vec<u64>,
+    /// The provider's own count of everything it was sent last turn: system
+    /// prompt, tool schemas and the whole history. This is what compaction
+    /// triggers on - an estimate of one part of the request would not do.
+    context_tokens: u32,
     iterations: u32,
     prompt_tokens: u32,
     completion_tokens: u32,
@@ -109,6 +118,8 @@ impl Turn {
             mode,
             max_iterations: config_u32("max_iterations", 32).min(ABSOLUTE_MAX_ITERATIONS),
             messages: Vec::new(),
+            origins: Vec::new(),
+            context_tokens: 0,
             iterations: 0,
             prompt_tokens: 0,
             completion_tokens: 0,
@@ -120,6 +131,7 @@ impl Turn {
 
     fn run(mut self) -> Result<TurnStats, String> {
         self.rehydrate();
+        self.maybe_compact();
 
         loop {
             if self.iterations >= self.max_iterations {
@@ -144,7 +156,7 @@ impl Turn {
 
             // Persist what the model said before acting on it, so the log is
             // truthful even if a tool call traps.
-            host::append(
+            let seq = host::append(
                 &self.session_id,
                 &SessionEvent::AssistantMessage(AssistantMsg {
                     content: reply.text.clone(),
@@ -154,7 +166,7 @@ impl Turn {
                 }),
             );
             self.record_usage(&reply.usage);
-            self.messages.push(assistant_message(&reply));
+            self.push(assistant_message(&reply), seq);
 
             if reply.tool_calls.is_empty() {
                 // The model is done talking. Only a nudge that landed while it
@@ -193,45 +205,130 @@ impl Turn {
     }
 
     /// Rebuilds the model's view of the conversation from the event log.
+    ///
+    /// Compactions are applied as a projection: the events they cover are
+    /// skipped and a summary note takes their place. Nothing is deleted, so an
+    /// earlier compaction never costs us the ability to read the original.
     fn rehydrate(&mut self) {
-        self.messages.push(json!({
-            "role": "system",
-            "content": self.system_prompt(),
-        }));
+        self.messages.clear();
+        self.origins.clear();
 
-        for record in host::events(&self.session_id, 0) {
+        self.push(
+            json!({ "role": "system", "content": self.system_prompt() }),
+            0,
+        );
+
+        let records = host::events(&self.session_id, 0);
+
+        // Which sequences a summary now stands for, and where each note goes.
+        let mut covered: Vec<(u64, u64)> = Vec::new();
+        let mut notes: Vec<(u64, Value)> = Vec::new();
+        for record in &records {
+            if let SessionEvent::ContextCompacted(c) = &record.event {
+                let (Some(first), Some(last)) = (c.spans.first(), c.spans.last()) else {
+                    continue;
+                };
+                for span in &c.spans {
+                    covered.push((span.from_seq, span.through_seq));
+                }
+                notes.push((
+                    first.from_seq,
+                    compaction::note(
+                        &c.summary,
+                        c.messages_replaced,
+                        first.from_seq,
+                        last.through_seq,
+                    ),
+                ));
+            }
+        }
+
+        for record in records {
+            if let Some(i) = notes.iter().position(|(seq, _)| *seq == record.seq) {
+                let (_, note) = notes.remove(i);
+                self.push(note, record.seq);
+            }
+            if covered
+                .iter()
+                .any(|(from, through)| record.seq >= *from && record.seq <= *through)
+            {
+                continue;
+            }
+            let seq = record.seq;
             match record.event {
                 SessionEvent::UserMessage(msg) => {
-                    self.messages
-                        .push(json!({ "role": "user", "content": user_content(&msg) }));
+                    self.push(json!({ "role": "user", "content": user_content(&msg) }), seq);
                 }
                 SessionEvent::Nudge(text) => {
-                    self.messages.push(json!({ "role": "user", "content": text }));
+                    self.push(json!({ "role": "user", "content": text }), seq);
                 }
                 SessionEvent::AssistantMessage(msg) => {
+                    // The last one wins: this ends up holding what the provider
+                    // charged for the most recent request.
+                    if let Some(usage) = &msg.usage {
+                        self.context_tokens = usage.prompt_tokens;
+                    }
                     let reply = Reply {
                         text: msg.content,
                         tool_calls: msg.tool_calls,
                         model: msg.model,
                         usage: msg.usage,
                     };
-                    self.messages.push(assistant_message(&reply));
+                    self.push(assistant_message(&reply), seq);
                 }
                 SessionEvent::ToolResult(out) => {
-                    self.messages.push(json!({
-                        "role": "tool",
-                        "tool_call_id": out.call_id,
-                        "content": out.content,
-                    }));
+                    self.push(
+                        json!({
+                            "role": "tool",
+                            "tool_call_id": out.call_id,
+                            "content": out.content,
+                        }),
+                        seq,
+                    );
                 }
                 SessionEvent::SystemNote(text) => {
-                    self.messages
-                        .push(json!({ "role": "system", "content": text }));
+                    self.push(json!({ "role": "system", "content": text }), seq);
                 }
                 // Bookkeeping events carry no conversational meaning.
                 _ => {}
             }
         }
+    }
+
+    /// Adds a message and the log sequence it came from together, so the two
+    /// lists cannot drift apart.
+    fn push(&mut self, message: Value, seq: u64) {
+        self.messages.push(message);
+        self.origins.push(seq);
+    }
+
+    /// Summarizes the oldest low-value stretch of the conversation when the
+    /// context has grown past its threshold.
+    ///
+    /// Runs before the turn rather than after it, so the turn about to happen is
+    /// the one that benefits. A failure is not fatal: the conversation simply
+    /// stays long, which is worse than compacting and better than not answering.
+    fn maybe_compact(&mut self) {
+        let policy = compaction::Policy::load();
+        if !policy.should_compact(self.context_tokens) {
+            return;
+        }
+
+        let Some(plan) =
+            compaction::plan(&self.messages, &self.origins, self.context_tokens, &policy)
+        else {
+            return;
+        };
+
+        let replaced = plan.messages_replaced;
+        host::append(&self.session_id, &SessionEvent::ContextCompacted(plan));
+
+        // Rebuild through the compaction just recorded.
+        self.rehydrate();
+        sys::log(
+            LogLevel::Info,
+            &format!("compaction: {replaced} messages replaced by a summary"),
+        );
     }
 
     /// The base prompt plus the instructions of every skill attached to this
@@ -318,12 +415,15 @@ impl Turn {
             },
         };
 
-        host::append(&self.session_id, &SessionEvent::ToolResult(result.clone()));
-        self.messages.push(json!({
-            "role": "tool",
-            "tool_call_id": result.call_id,
-            "content": result.content,
-        }));
+        let seq = host::append(&self.session_id, &SessionEvent::ToolResult(result.clone()));
+        self.push(
+            json!({
+                "role": "tool",
+                "tool_call_id": result.call_id,
+                "content": result.content,
+            }),
+            seq,
+        );
     }
 
     /// Folds any mid-turn input into the conversation and reports what it found.
@@ -334,7 +434,10 @@ impl Turn {
             match item {
                 InboxItem::Nudge(text) => {
                     sys::log(LogLevel::Info, &format!("nudged mid-turn: {text}"));
-                    self.messages.push(json!({ "role": "user", "content": text }));
+                    // The host logs the nudge itself; this is the same text
+                    // reaching the model within the turn already running, so it
+                    // has no sequence of its own to point at.
+                    self.push(json!({ "role": "user", "content": text }), 0);
                     // Cancellation outranks a nudge; never downgrade it.
                     if !matches!(interrupt, Interrupt::Cancelled) {
                         interrupt = Interrupt::Nudged;
