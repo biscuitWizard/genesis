@@ -9,6 +9,9 @@ import { store } from "../lib/store.js";
 
 let root = null;
 let live = null; // element collecting streamed tokens
+// Tool calls awaiting their result, by call id. A call and its result are one
+// row, so the result has to find the row the call opened.
+const open = new Map();
 
 export function mountTranscript() {
   root = $("transcript");
@@ -17,6 +20,7 @@ export function mountTranscript() {
 
 export function reset() {
   live = null;
+  open.clear();
   clear(root);
 }
 
@@ -70,15 +74,88 @@ function meta(text, tone = "") {
   root.append(el("div", { class: `meta ${tone}`.trim() }, text));
 }
 
-function toolCard(name, body, tone) {
-  root.append(
-    el(
-      "details",
-      { class: `tool ${tone}`.trim() },
-      el("summary", {}, el("span", { class: "tool-name" }, name)),
-      el("pre", {}, body || "")
-    )
+function cut(text, max) {
+  const flat = String(text ?? "").replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+}
+
+/** Pretty-print JSON when it is JSON, and leave anything else alone. */
+function pretty(raw) {
+  if (!raw) return "";
+  try {
+    return JSON.stringify(JSON.parse(raw), null, 2);
+  } catch {
+    return raw;
+  }
+}
+
+/** The gist of a call's arguments, short enough to sit on the summary line. */
+function gist(raw) {
+  if (!raw) return "";
+  let value;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return cut(raw, 80);
+  }
+  if (value === null || typeof value !== "object") return cut(value, 80);
+
+  return cut(
+    Object.entries(value)
+      .map(([k, v]) => `${k}: ${cut(typeof v === "string" ? v : JSON.stringify(v), 40)}`)
+      .join("  ·  "),
+    90
   );
+}
+
+function section(label, body) {
+  return [el("div", { class: "tool-label" }, label), el("pre", {}, body || "")];
+}
+
+/* One row per tool call.
+ *
+ * A call and the result it returns are one thing to a reader - what ran, and
+ * what came back - so they share a row instead of stacking two cards. The row
+ * opens on the call and is completed by the result, matched on the call id the
+ * host puts on both.
+ */
+function toolRow(ev) {
+  const node = el(
+    "details",
+    { class: "tool is-running" },
+    el(
+      "summary",
+      {},
+      el("span", { class: "tool-name" }, ev.name),
+      el("span", { class: "tool-args" }, gist(ev.arguments)),
+      el("span", { class: "tool-status" }, "running")
+    ),
+    ...section("arguments", pretty(ev.arguments))
+  );
+  root.append(node);
+  return node;
+}
+
+/** Fills in the row a call opened, or makes a standalone one if it is missing. */
+function completeToolRow(ev) {
+  let node = open.get(ev.id);
+  open.delete(ev.id);
+
+  if (!node) {
+    // A result with no call in view: replaying a truncated log, or a call that
+    // predates this connection. Better a row on its own than a dropped result.
+    node = el("details", { class: "tool" }, el("summary", {},
+      el("span", { class: "tool-name" }, ev.name),
+      el("span", { class: "tool-args" }, ""),
+      el("span", { class: "tool-status" }, "")));
+    root.append(node);
+  }
+
+  node.classList.remove("is-running");
+  node.classList.toggle("is-bad", !ev.ok);
+  const status = node.querySelector(".tool-status");
+  if (status) status.textContent = ev.ok ? "ok" : "failed";
+  node.append(...section("result", ev.content));
 }
 
 function thumbs(attachments) {
@@ -135,16 +212,10 @@ const RENDERERS = {
 
   "tool-call"(ev) {
     live = null;
-    toolCard(`called ${ev.name}`, ev.arguments, "");
+    open.set(ev.id, toolRow(ev));
   },
 
-  "tool-result"(ev) {
-    toolCard(
-      `${ev.name} ${ev.ok ? "returned" : "failed"}`,
-      ev.content,
-      ev.ok ? "" : "is-bad"
-    );
-  },
+  "tool-result": completeToolRow,
 
   nudge: (ev) => meta(`you interrupted: ${ev.text}`, "is-nudge"),
   note: (ev) => meta(ev.text),

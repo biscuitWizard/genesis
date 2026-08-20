@@ -348,9 +348,50 @@ button, input, textarea { font: inherit; color: inherit; }
   opacity: .7;
 }
 .tool[open] > summary::before { transform: rotate(45deg); }
-.tool-name { color: var(--text); font-weight: 600; }
+.tool-name { color: var(--text); font-weight: 600; flex: none; }
 .tool.is-bad .tool-name { color: var(--err); }
 .tool.is-good .tool-name { color: var(--ok); }
+
+/* The gist of the arguments, and the only part that may shrink: the tool's
+   name and its status have to stay readable however narrow the pane gets. */
+.tool-args {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.tool-status {
+  flex: none;
+  padding: 1px 8px;
+  border: 1px solid var(--hairline);
+  border-radius: 999px;
+  font-size: var(--text-xs);
+  color: var(--text-dim);
+}
+/* A slow tool should look busy rather than stuck. */
+.tool.is-running .tool-status { animation: pulse 1.4s var(--ease) infinite; }
+.tool.is-bad .tool-status {
+  color: var(--err);
+  border-color: color-mix(in srgb, var(--err) 45%, transparent);
+}
+
+.tool-label {
+  padding: 8px 13px 0;
+  border-top: 1px solid var(--hairline);
+  background: var(--bg);
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+/* The label already carries the divider; a second one under it reads as a gap. */
+.tool-label + pre { border-top: 0; padding-top: 5px; }
 
 .tool pre {
   margin: 0;
