@@ -287,7 +287,16 @@ impl Turn {
                     );
                 }
                 SessionEvent::SystemNote(text) => {
-                    self.push(json!({ "role": "system", "content": text }), seq);
+                    // Deliberately not a `system` message. A note is appended
+                    // wherever the log happens to be - after a tool result, or
+                    // between two user turns - and a `system` message that
+                    // neither precedes an assistant turn nor ends the array is
+                    // rejected outright by Anthropic. The marker keeps it from
+                    // reading as something the user said.
+                    self.push(
+                        json!({ "role": "user", "content": format!("[system note] {text}") }),
+                        seq,
+                    );
                 }
                 // Bookkeeping events carry no conversational meaning.
                 _ => {}

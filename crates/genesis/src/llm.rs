@@ -109,6 +109,15 @@ impl LlmClient {
                 .to_string()
         };
 
+        let repaired = normalize_system_roles(&mut body);
+        if repaired > 0 {
+            tracing::warn!(
+                count = repaired,
+                "moved stray system messages to the user role; a guest built a request \
+                 the provider would have rejected"
+            );
+        }
+
         // Last, and only once the model is settled: which provider is about to
         // serve this decides whether breakpoints help or merely cost writes.
         let marked = crate::cache::apply(&mut body, &model, &self.cfg.cache);
@@ -440,9 +449,117 @@ struct SsePromptDetails {
     cache_write_tokens: Option<u32>,
 }
 
+/// Repairs a message array whose `system` messages sit where a provider will
+/// refuse them, returning how many were moved.
+///
+/// Anthropic requires a `system` message to precede an `assistant` message or
+/// end the array; one sitting before a `user` or a `tool` result is a hard 400
+/// that costs the whole turn. A guest produces that innocently — a note appended
+/// mid-conversation lands wherever the log had reached — and since the guest is
+/// something the agent can rewrite, the check belongs here as well as there.
+///
+/// The repair changes the role and nothing else. The text is what carries the
+/// meaning, and every provider accepts a user message in any position.
+fn normalize_system_roles(body: &mut serde_json::Value) -> usize {
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return 0;
+    };
+
+    let role_at = |messages: &[serde_json::Value], i: usize| -> String {
+        messages
+            .get(i)
+            .and_then(|m| m.get("role"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    let mut moved = 0;
+    // Index 0 is the system prompt, which is always valid where it is.
+    for i in 1..messages.len() {
+        if role_at(messages, i) != "system" {
+            continue;
+        }
+        // Allowed: it ends the array, or an assistant turn follows it.
+        let last = i + 1 == messages.len();
+        if last || role_at(messages, i + 1) == "assistant" {
+            continue;
+        }
+        if let Some(obj) = messages[i].as_object_mut() {
+            obj.insert("role".into(), serde_json::Value::from("user"));
+            moved += 1;
+        }
+    }
+    moved
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn roles(body: &serde_json::Value) -> Vec<String> {
+        body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_system_note_before_a_user_message_is_moved() {
+        // Exactly the shape that was rejected: a note appended after a tool
+        // result, with the conversation carrying on afterwards.
+        let mut body = serde_json::json!({ "messages": [
+            { "role": "system", "content": "prompt" },
+            { "role": "user", "content": "go" },
+            { "role": "assistant", "content": "working" },
+            { "role": "system", "content": "Interrupted: Genesis restarted." },
+            { "role": "user", "content": "carry on" },
+        ]});
+
+        assert_eq!(normalize_system_roles(&mut body), 1);
+        assert_eq!(
+            roles(&body),
+            ["system", "user", "assistant", "user", "user"]
+        );
+        // The text is untouched; only where it is allowed to sit changed.
+        assert_eq!(body["messages"][3]["content"], "Interrupted: Genesis restarted.");
+    }
+
+    #[test]
+    fn the_leading_prompt_and_the_allowed_positions_are_left_alone() {
+        let mut body = serde_json::json!({ "messages": [
+            { "role": "system", "content": "prompt" },
+            { "role": "user", "content": "go" },
+            // Allowed: an assistant turn follows.
+            { "role": "system", "content": "before an assistant" },
+            { "role": "assistant", "content": "hi" },
+            // Allowed: it ends the array.
+            { "role": "system", "content": "at the end" },
+        ]});
+
+        assert_eq!(normalize_system_roles(&mut body), 0);
+        assert_eq!(roles(&body), ["system", "user", "system", "assistant", "system"]);
+    }
+
+    #[test]
+    fn a_system_note_before_a_tool_result_is_moved() {
+        let mut body = serde_json::json!({ "messages": [
+            { "role": "system", "content": "prompt" },
+            { "role": "assistant", "content": "", "tool_calls": [] },
+            { "role": "system", "content": "note" },
+            { "role": "tool", "tool_call_id": "c1", "content": "result" },
+        ]});
+        assert_eq!(normalize_system_roles(&mut body), 1);
+        assert_eq!(roles(&body)[2], "user");
+    }
+
+    #[test]
+    fn a_request_without_messages_is_not_a_problem() {
+        let mut body = serde_json::json!({ "model": "x" });
+        assert_eq!(normalize_system_roles(&mut body), 0);
+    }
 
     async fn drain(sse: &str) -> Vec<StreamChunk> {
         let (tx, mut rx) = mpsc::channel(64);
