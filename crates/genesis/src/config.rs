@@ -62,6 +62,12 @@ pub struct ModeSpec {
     /// Whether tools that change things are withheld in this mode. Carried to
     /// the agent so a new mode needs no agent code.
     pub read_only: bool,
+    /// Appended to the system prompt while this mode is active.
+    ///
+    /// Withholding tools tells the model what it cannot do, but never what it
+    /// should do instead - it just meets the gap and works around it. This is
+    /// where a mode says what it is for.
+    pub prompt: String,
 }
 
 #[derive(Debug, Clone)]
@@ -476,6 +482,8 @@ mod spec {
         pub description: String,
         #[serde(default)]
         pub read_only: bool,
+        #[serde(default)]
+        pub prompt: String,
     }
 
     #[derive(Debug, Deserialize)]
@@ -886,6 +894,7 @@ impl Config {
                     id: m.id,
                     description: m.description,
                     read_only: m.read_only,
+                    prompt: m.prompt,
                 })
                 .collect()
         };
@@ -1138,6 +1147,12 @@ fn default_shell_args() -> Vec<String> {
     }
 }
 
+/// What Plan mode tells the model it is for.
+///
+/// It lives with the mode that uses it rather than in the base system prompt,
+/// which has to stay true in every mode.
+const PLAN_PROMPT: &str = "You are in Plan mode. Every tool that would change something is withheld, so you cannot edit code, run commands, or modify the running system. Read and reason only.\n\nProduce a plan, not an implementation:\n- Investigate first with the read-only tools you do have. A plan written without looking at the code is a guess.\n- Say what you would change, file by file, and why each change is needed.\n- Name the decisions that are the user's to make, and the risks worth checking before starting.\n- Sketch the shape of code rather than writing it out in full. You cannot compile it here, and untested code reads as more certain than it is.\n\nIf you find yourself wanting a tool that is not offered, say what you would have done with it instead of quietly working around it. When the plan is ready, say so plainly and stop; the user will switch to Agent mode to carry it out.";
+
 fn builtin_modes() -> Vec<ModeSpec> {
     vec![
         ModeSpec {
@@ -1145,6 +1160,7 @@ fn builtin_modes() -> Vec<ModeSpec> {
             label: "Agent".into(),
             description: "Full access. Runs tools and can modify the running system.".into(),
             read_only: false,
+            prompt: String::new(),
         },
         ModeSpec {
             id: "plan".into(),
@@ -1153,6 +1169,7 @@ fn builtin_modes() -> Vec<ModeSpec> {
                 "Reads and reasons, but makes no changes. Tools that would modify anything are withheld."
                     .into(),
             read_only: true,
+            prompt: PLAN_PROMPT.into(),
         },
     ]
 }
@@ -1461,5 +1478,49 @@ allowed_crates = [\"c\"]
         let crates = build.get("allowed_crates").unwrap().as_array().unwrap();
         assert_eq!(crates.len(), 1);
         assert_eq!(crates[0].as_str(), Some("c"));
+    }
+
+    /// The config that ships with the repo must actually load.
+    ///
+    /// `deny_unknown_fields` makes this a real risk: adding a key to
+    /// genesis.toml without adding it to the spec is an error that only shows
+    /// up at startup, on whichever machine picks the file up first.
+    #[test]
+    fn the_shipped_config_file_parses() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root");
+        let path = root.join("genesis.toml");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+
+        Config::validate(&text, root)
+            .unwrap_or_else(|e| panic!("the shipped genesis.toml does not load: {e:#}"));
+    }
+
+    #[test]
+    fn a_mode_can_carry_a_prompt() {
+        let cfg = from_toml(
+            r#"
+[[modes]]
+id = "agent"
+label = "Agent"
+
+[[modes]]
+id = "plan"
+read_only = true
+prompt = "Plan only."
+"#,
+        )
+        .unwrap();
+
+        let plan = cfg.modes.iter().find(|m| m.id == "plan").unwrap();
+        assert!(plan.read_only);
+        assert_eq!(plan.prompt, "Plan only.");
+
+        // A mode that says nothing extra carries an empty prompt, not a default.
+        let agent = cfg.modes.iter().find(|m| m.id == "agent").unwrap();
+        assert!(agent.prompt.is_empty());
     }
 }

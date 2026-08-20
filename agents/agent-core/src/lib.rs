@@ -239,6 +239,15 @@ impl Turn {
     fn system_prompt(&self) -> String {
         let mut prompt = config_str("system_prompt", "You are a helpful assistant.");
 
+        // What the active mode is for. Withholding tools tells the model what it
+        // cannot do, but never what it should do instead - left to itself it
+        // just meets the gap and works around it.
+        if let Some(mode) = sys::list_modes().into_iter().find(|m| m.id == self.mode) {
+            if !mode.prompt.trim().is_empty() {
+                prompt.push_str(&format!("\n\n# Mode: {}\n{}", mode.label, mode.prompt));
+            }
+        }
+
         let attached: Vec<_> = host::list_skills(&self.session_id)
             .into_iter()
             .filter(|s| s.enabled)

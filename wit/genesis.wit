@@ -138,6 +138,9 @@ interface types {
     /// Whether tools that change things are withheld. The agent reads this
     /// rather than knowing any mode by name, so a new mode is configuration.
     read-only: bool,
+    /// Appended to the system prompt while this mode is active. Empty for a
+    /// mode that only changes which tools are offered.
+    prompt: string,
   }
 
   // Delivered to the gateway for rendering. `seq` is none for transient events.

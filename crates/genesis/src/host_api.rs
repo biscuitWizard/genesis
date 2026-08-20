@@ -162,6 +162,7 @@ impl sys::Host for HostState {
                 label: m.label.clone(),
                 description: m.description.clone(),
                 read_only: m.read_only,
+                prompt: m.prompt.clone(),
             })
             .collect())
     }
