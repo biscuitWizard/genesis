@@ -30,8 +30,7 @@ mod tools;
 
 struct Component;
 
-/// Hard ceiling on loop iterations, in case configuration is missing or absurd.
-const ABSOLUTE_MAX_ITERATIONS: u32 = 64;
+
 
 impl Guest for Component {
     fn health() -> String {
