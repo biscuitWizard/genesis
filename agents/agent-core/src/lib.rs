@@ -63,12 +63,6 @@ fn config_str(key: &str, fallback: &str) -> String {
     sys::config_get(key).unwrap_or_else(|| fallback.to_string())
 }
 
-fn config_u32(key: &str, fallback: u32) -> u32 {
-    sys::config_get(key)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(fallback)
-}
-
 // --- the turn ---------------------------------------------------------------
 
 struct Turn {
@@ -115,7 +109,7 @@ impl Turn {
             session_id,
             model,
             mode,
-            max_iterations: config_u32("max_iterations", 32).min(ABSOLUTE_MAX_ITERATIONS),
+            max_iterations: u32::MAX,
             messages: Vec::new(),
             origins: Vec::new(),
             context_tokens: 0,
